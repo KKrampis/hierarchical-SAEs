@@ -1,0 +1,249 @@
+comprehensive_paper_analysis:
+  executive_summary:
+    paper_title: "Incorporating Hierarchical Semantics in Sparse Autoencoder Architectures"
+    core_contribution: |
+      Translates Park et al. (2024)'s geometric theory of categorical concepts (every concept has
+      a binary "parent" feature plus a low-rank child-value subspace) directly into a
+      mixture-of-experts SAE architecture (H-SAE): a top-level SAE selects k active "expert"
+      concepts, and each activated expert runs its own small low-level SAE (with a fixed TopK=1)
+      inside a learned low-dimensional subspace. Because inactive experts are never computed at
+      all (not just masked), this yields both a large effective dictionary size AND large
+      compute/memory savings, while empirically improving reconstruction, matching or improving
+      interpretability, and reducing feature splitting/absorption/cross-lingual redundancy
+      relative to a flat TopK SAE baseline.
+    implementation_complexity: "Medium-High"
+    estimated_components: 5  # top-level SAE, per-expert projection pair, per-expert low-level SAE,
+                              # combined H-SAE forward/loss module, evaluation suite (absorption,
+                              # cross-lingual redundancy, hierarchy visualization)
+    key_geometric_theory: "Park et al. (2024): a categorical concept is represented by a parent (binary presence) feature plus a low-rank subspace whose points are child (value) features; a child concept = parent concept vector + child-in-context-of-parent vector."
+
+  complete_structure_map:
+    title: "Incorporating Hierarchical Semantics in Sparse Autoencoder Architectures"
+
+    sections:
+      1_introduction:
+        main_claims: |
+          Standard SAEs neither exploit nor represent semantic relationships between learned
+          concepts, and larger SAEs exhibit "feature splitting" (a broad concept fragmenting into
+          many narrow features) as a symptom of this. Real-world concepts are naturally
+          hierarchical (e.g. "dog" -> "corgi"/"greyhound"/"shitzu"). The paper's contribution is an
+          SAE architecture that explicitly and efficiently models this hierarchy as a
+          mixture-of-experts structure, directly instantiating Park et al. (2024)'s geometric
+          theory of categorical concepts.
+        problem_definition: |
+          Design an SAE architecture (not just a training-time regularizer) that explicitly
+          represents a two-level concept hierarchy (parent/child, i.e. high-level/low-level), is
+          computationally efficient (conditional/sparse compute over the low-level structure), and
+          empirically improves the reconstruction-interpretability frontier relative to a flat
+          TopK SAE baseline of comparable or larger size.
+
+      2_related_work:
+        key_comparisons: |
+          Baseline: TopK SAE (Gao et al. 2024, Eq. 2.1-2.2), the architecture this paper directly
+          extends. Closest related structural work: Matryoshka SAEs (Bussmann et al. 2025) and
+          EWG-SAEs (Li & Ren 2025), which group dictionary atoms into coarse/fine groupings via a
+          modified TRAINING OBJECTIVE but keep a flat/unstructured dictionary architecture --
+          contrasted directly with this paper's explicit ARCHITECTURAL change. Switch SAEs (Mudide
+          et al. 2025) share a mixture-of-experts routing mechanism structurally, but are motivated
+          purely by reconstruction-vs-compute efficiency with no high/low-level distinction and no
+          decoder-feature clustering (explicitly noted by that paper's own authors). Hindupur et
+          al. (2025) establish a duality between SAE architecture and assumed concept geometry,
+          providing the broader theoretical motivation for architecture-level (rather than purely
+          training-objective-level) interventions. Also connects to causal representation learning
+          (CRL) more broadly (Locatello et al., Schölkopf et al., etc.) as motivation for
+          disentangled concept representations.
+
+      3_method:
+        subsections:
+          "3.1": "Architecture: Hierarchical Geometry motivation (Park et al. 2024), the 3-part architecture (top-level SAE, per-expert projections, per-expert low-level SAE), the Forward Pass (Eq. 3.1, Algorithm 1), and Computational Efficiency analysis"
+          "3.2": "Training Objective: Reconstruction Loss (Eq. 3.3), Auxiliary Losses (bi-orthogonality Eq. 3.4, L1 sparsity)"
+        algorithms_presented:
+          - "Algorithm 1: Hierarchical SAE Forward Pass and Loss Computation (the paper's single, complete, explicitly-boxed algorithm)"
+
+      4_experiments:
+        environments: |
+          1 billion residual-stream activation vectors from layer 20 of Gemma 2-2B, collected over
+          a large multilingual Wikipedia corpus (English + 128 largest non-English Wikipedias,
+          proportional to active users), first 256 tokens per selected article. Ablation-only
+          environment (Appendix B): the Gemma 2-2B token UNEMBEDDING matrix (186,032 filtered
+          tokens out of 256,128), which requires a separate whitening preprocessing step due to its
+          non-Euclidean semantic geometry (Park et al. 2024's causal inner product).
+        baselines: |
+          TopK SAE (Gao et al. 2024) at matched top-level dictionary sizes (8k/16k/32k), trained on
+          identical data for the same 4 epochs; separately noted to perform equivalently to Gemma
+          Scope JumpReLU SAEs (Lieberum et al. 2024) on reconstruction, making it a strong/fair
+          baseline. Ablation-only baselines (Appendix B): H-SAE variants with the orthogonality
+          loss removed, the L1 loss removed, both removed, or (Appendix B.3) the causal-inner-product
+          whitening preprocessing removed.
+        metrics: |
+          (a) 1 - explained variance (normalized L2 reconstruction loss); (b) SAEBench-normalized
+          downstream LLM cross-entropy loss when substituting reconstructed activations (1 - CE loss
+          score); (c) SAEBench first-letter classification absorption benchmark (Karvonen et al.
+          2025), reporting the fraction of a first-letter classification probe's projection onto SAE
+          activations NOT explained by a single feature (lower = less splitting/absorption); (d) a
+          novel cross-lingual redundancy metric: symmetric set difference (0-16) between the top-8
+          activated features for the same token/context translated into different languages
+          (French/Spanish/German via Gemini-2.0-Flash), lower = more shared/composable features
+          across languages; (e) qualitative hierarchy-quality visualization on both embeddings and
+          unembeddings.
+
+      5_results:
+        main_findings: |
+          H-SAE dramatically improves reconstruction at every tested dictionary size and sublatent
+          count: "the H-SAE with 64 sublatents per expert is on par with the standard SAE with 32
+          top-level features, despite having 1/4 the compute cost" (Figure 3). H-SAE features are
+          qualitatively at least as interpretable as the baseline's, often capturing more granular,
+          contextually-appropriate structure (Figure 4 case studies). H-SAE shows LOWER first-letter
+          absorption (Figure 5a) and a SLOWER rate-of-increase in absorption as dictionary width
+          grows, indicating better-behaved scaling. H-SAE shows LOWER cross-lingual feature
+          redundancy across all three language pairs tested (Figure 5b, Table with exact set-difference
+          values). Qualitative visualization on embeddings/unembeddings (Figures 1, 6, 7) shows the
+          low-level sublatents activate selectively and meaningfully only when the fine-grained
+          concept is truly relevant (e.g. "Python" language vs. snake sub-concepts), confirming
+          genuine hierarchical semantics are learned, not just an unstructured extra capacity boost.
+          Ablations (Appendix B.2) find neither the orthogonality nor L1 loss is strictly NECESSARY
+          for interpretability/hierarchy to emerge on the (small-scale, unembedding-matrix) ablation
+          task, though orthogonality empirically helps avoid dead top-level latents in practice.
+          Appendix B.3 shows the causal-inner-product whitening preprocessing IS necessary on the
+          unembedding matrix specifically (its geometry is fundamentally non-Euclidean), though this
+          preprocessing is NOT used/needed for the main residual-stream-activation experiments.
+        tables_figures: |
+          Figure 3 (reconstruction: 1-CE-loss-score and 1-explained-variance vs. dictionary size,
+          16 vs. 64 sublatents) -- the primary quantitative reproduction target for the
+          reconstruction-improvement claim. Figure 5a (mean absorption fraction score vs. dictionary
+          size) and Figure 5b / its accompanying table (cross-lingual mean set-difference by language
+          pair, exact numeric values given: e.g. English-French H-SAE=8.448 vs. SAE=9.772) are
+          reproduction targets for the interpretability/redundancy claims. Algorithm 1 is the primary
+          algorithmic reproduction target (this IS the whole method). Figures 1, 4, 6, 7 are
+          qualitative case studies useful as end-to-end sanity checks ("does the pipeline discover
+          sensible hierarchies") but not strictly numerically reproducible.
+
+  method_architecture:
+    method_name: "Hierarchical Sparse Autoencoder (H-SAE) -- mixture-of-experts architecture"
+
+    core_components:
+      component_1:
+        name: "Top-level SAE (E, D)"
+        purpose: "Captures the binary 'is this high-level concept present' parent feature for each of m_top concepts, per Park et al. (2024)'s categorical-concept geometry."
+        paper_section: "Section 3.1, item 1 of the 3-part architecture description"
+
+      component_2:
+        name: "Per-expert down/up projection pair (Pi_down_j, Pi_up_j)"
+        purpose: "Maps between the full activation space and expert j's low-dimensional (dimension s) subspace, representing the low-rank polytope of the categorical concept's possible child values."
+        paper_section: "Section 3.1, item 2"
+
+      component_3:
+        name: "Per-expert low-level SAE (E_j, D_j), TopK_1"
+        purpose: "Within an activated expert's subspace, selects the SINGLE most active sub-concept/child value (e.g. which breed of dog), operationalizing the 'child = vertex of the parent's polytope' geometric picture."
+        paper_section: "Section 3.1, item 3"
+
+      component_4:
+        name: "H-SAE forward + multi-term loss (Algorithm 1)"
+        purpose: "Orchestrates components 1-3 into a single combined reconstruction (Eq. 3.1) and computes the full training objective (reconstruction + top-level-only reconstruction + orthogonality + sparsity, Eq. 3.2-3.4)."
+        paper_section: "Section 3.1-3.2, Algorithm 1"
+
+      component_5:
+        name: "Evaluation suite: absorption, cross-lingual redundancy, hierarchy visualization"
+        purpose: "Quantifies whether the architecture actually reduces feature splitting/absorption and cross-lingual feature redundancy relative to the flat baseline, and qualitatively confirms learned hierarchy is semantically meaningful."
+        paper_section: "Section 4, 4.1"
+
+    component_interactions:
+      - "Component 1's TopK_k selection determines WHICH experts (Components 2+3) get computed at all for a given input -- only the k selected experts' projection/low-level-SAE parameters participate in that forward pass."
+      - "Component 2's down-projection feeds Component 3's low-level encoder; Component 3's low-level decoder output feeds back through Component 2's up-projection to be accumulated into the final reconstruction."
+      - "Component 4 sums Component 1's high-level reconstruction (x_hat_high = Dz) with the accumulated low-level contributions from all active experts (x_hat_low) to form the final x_hat, and separately keeps x_hat_high available for the top-level-only auxiliary reconstruction loss term."
+      - "Component 4's orthogonality loss reads only Component 1's (E, D) -- it has no interaction with Components 2-3."
+      - "Component 5 is an offline/evaluation-time consumer of a trained H-SAE (or baseline TopK SAE), applied to held-out activations, translated cross-lingual text, and (for qualitative hierarchy visualization) the model's embedding/unembedding matrices directly."
+
+    theoretical_foundation:
+      key_insight: |
+        Park et al. (2024) show, geometrically, that a categorical concept in an LLM's
+        representation space decomposes as a BINARY PARENT direction (concept present/absent) plus
+        a LOW-RANK subspace of CHILD directions (one per possible value), and that a specific child
+        representation equals the parent vector PLUS a "child-in-the-context-of-the-parent" vector
+        living in that low-rank subspace. This is EXACTLY the structure Eq. 3.1 implements
+        architecturally: z_j * d_j is the parent contribution, and Pi_up_j @ SAE1_j(Pi_down_j @ x)
+        is the child-in-context contribution, summed together per active expert. Because this
+        geometric structure is imposed by the ARCHITECTURE (which experts even get computed, and
+        how their output is combined) rather than merely encouraged by a training-time penalty
+        (contrast: Matryoshka/EWG-SAEs), both interpretability (the hierarchy is directly legible
+        from which expert + which sublatent fired) and computational efficiency (only active
+        experts are computed) follow as direct consequences.
+      why_it_works: |
+        Making the low-level SAE conditional on its parent expert being active is not just an
+        efficiency trick -- it is a genuine STRUCTURAL PRIOR that mirrors the real geometry: a
+        sub-concept vector is meaningless/undefined outside the context of its parent concept being
+        present (you cannot have a "corgi" activation pattern without also having a "dog" one). By
+        making this a computational IMPOSSIBILITY (the low-level SAE is architecturally never even
+        invoked when its parent is inactive) rather than a soft constraint, the model cannot learn
+        degenerate shortcuts that violate the hierarchy, and the extra low-level capacity is
+        additionally cheap to add (near-zero asymptotic overhead when k << m_top and s << d),
+        letting the effective dictionary size scale multiplicatively (m_top * m_low) rather than
+        additively, at a fraction of the compute cost of an equivalently-sized flat SAE.
+
+  implementation_requirements:
+    algorithms_to_implement:
+      - algorithm: "H-SAE forward pass + multi-term loss (Algorithm 1 / Eq. 3.1-3.4)"
+        section: "Section 3.1-3.2"
+        complexity: "Medium"
+        dependencies: ["top-level SAE (E,D)", "per-expert projections", "per-expert low-level SAEs"]
+
+    models_to_build:
+      - model: "TopLevelSAE (E, D)"
+        architecture_location: "Section 3.1, item 1; matches the baseline SAE_k structure (Eq. 2.1) minus the bias subtraction"
+        purpose: "The parent/high-level concept detector."
+
+      - model: "ExpertLowLevelSAE (Pi_down_j, E_j, D_j, Pi_up_j) x m_top"
+        architecture_location: "Section 3.1, items 2-3"
+        purpose: "One low-level, subspace-restricted, TopK_1 SAE per top-level expert, computed only when that expert is active."
+
+      - model: "HSAE (combines TopLevelSAE + all ExpertLowLevelSAE modules)"
+        architecture_location: "Section 3.1, Eq. 3.1; Algorithm 1"
+        purpose: "The complete model: sparse top-level routing + conditional low-level refinement + combined reconstruction."
+
+    data_processing:
+      - pipeline: "Activation collection from Gemma 2-2B layer 20"
+        requirements: "Run Gemma 2-2B over multilingual Wikipedia text, extract layer-20 residual-stream activations for the first 256 tokens of each selected article, strip BOS/EOS, unit-normalize (no mean subtraction), shuffle on disk, collect until 1B vectors."
+
+      - pipeline: "Cross-lingual redundancy test data"
+        requirements: "Sample 1000 English sequences (16-48 tokens) from the training data; translate each into French, Spanish, and German via Gemini-2.0-Flash; collect top-8 activated features on the last token of each language version for both baseline and H-SAE."
+
+      - pipeline: "Unembedding-matrix whitening (ablation-only)"
+        requirements: "Compute the covariance matrix of the (filtered, 186,032-token) Gemma 2-2B unembedding matrix and multiply by its inverse square root before H-SAE training, to align the Euclidean inner product with the causal/semantic geometry (Park et al. 2024)."
+
+    evaluation_suite:
+      - metric: "1 - Explained Variance / SAEBench CE loss score"
+        formula_location: "Section 4 ('Reconstruction')"
+        purpose: "Standard SAE reconstruction-quality metrics, at matched dictionary sizes."
+
+      - metric: "SAEBench first-letter classification absorption benchmark"
+        formula_location: "Section 4.1 ('Interpretability'), Karvonen et al. (2025)"
+        purpose: "Measures feature splitting/absorption: fraction of a first-letter-classification linear probe's projection not explained by a single SAE feature."
+
+      - metric: "Cross-lingual feature-redundancy set difference"
+        formula_location: "Section 4.1, described in prose (no closed-form numbered equation)"
+        purpose: "Measures whether semantically-identical tokens in different languages activate similar (low set-difference) or divergent (high set-difference, indicating redundant per-language features) feature sets."
+
+  reproduction_roadmap:
+    phase_1: |
+      Implement the TopLevelSAE, the per-expert projection + low-level SAE modules, and the combined
+      HSAE forward pass (Eq. 3.1) with a placeholder loss; validate shapes and that only the k active
+      experts' parameters are touched (gather/index-based, not full-dictionary masking) on a small
+      synthetic activation dataset.
+    phase_2: |
+      Implement the full multi-term loss (Eq. 3.2-3.4) including the top-level-only auxiliary
+      reconstruction, orthogonality penalty, and L1 sparsity, plus their linear warmup over the first
+      1000 steps; validate that training reduces reconstruction loss and that the orthogonality
+      penalty measurably reduces dead top-level latents relative to a run without it.
+    phase_3: |
+      Implement the baseline TopK SAE (Eq. 2.1-2.2) for comparison, and a small evaluation suite
+      (reconstruction quality, and a toy absorption-style probing metric on synthetic data with known
+      ground-truth hierarchical structure); compare H-SAE vs. baseline reconstruction at matched
+      top-level dictionary size, expecting H-SAE to win given its additional (conditionally-computed)
+      capacity.
+
+  validation_checklist:
+    - "[ ] H-SAE's forward pass only computes/gathers parameters for the k currently-active experts per batch element (or, at minimum, produces numerically identical results to doing so if implemented via masking for simplicity), matching Eq. 3.1's structure."
+    - "[ ] The low-level SAE for every active expert always yields exactly one nonzero low-level latent (TopK_1 architectural invariant)."
+    - "[ ] H-SAE trains without diverging on a small-scale synthetic run and its combined + top-level-only reconstruction losses both decrease."
+    - "[ ] At matched top-level dictionary size and comparable total compute, H-SAE achieves lower reconstruction loss than the baseline TopK SAE on synthetic data with a true hierarchical (parent+child-in-subspace) generative structure, replicating the qualitative direction of Figure 3."
+    - "[ ] The orthogonality penalty, when enabled, measurably reduces the fraction of dead top-level latents relative to a run with lambda_1=0, on a small-scale run."

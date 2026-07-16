@@ -1,0 +1,301 @@
+complete_algorithm_extraction:
+  paper_structure:
+    method_sections: ["2", "3", "3.1", "3.2", "Algorithm 1", "Appendix A", "Appendix B"]
+    algorithm_count: 1  # a single unified architecture+loss algorithm (Algorithm 1: Hierarchical SAE
+                         # Forward Pass and Loss Computation); the baseline TopK SAE (Eq. 2.1-2.2) is
+                         # a supporting/comparison algorithm, not the paper's contribution
+
+  main_algorithm:
+    algorithm_name: "Hierarchical Sparse Autoencoder (H-SAE): mixture-of-experts SAE with a top-level SAE and per-expert low-level SAEs"
+    section: "Section 3.1-3.2, Algorithm 1 (explicit box, line 212 of the extracted text)"
+    algorithm_box: "Algorithm 1 'Hierarchical SAE Forward Pass and Loss Computation' -- explicit box in the paper, reproduced verbatim below."
+
+    pseudocode: |
+      # Verbatim from Algorithm 1 in the paper (Section 3.1-3.2)
+      function ForwardPass(x):
+          z <- TopK_k(LeakyReLU_alpha(E x))                      # High-level encoding (NOTE: no
+                                                                  # bias subtraction here, unlike the
+                                                                  # baseline Eq. 2.1 SAE_k(x) which
+                                                                  # subtracts a bias b before encoding
+                                                                  # -- the paper's actual experiments
+                                                                  # use neither a mean-subtraction nor
+                                                                  # a bias term, Section 4 "Experimental
+                                                                  # Setup")
+          K <- indices of nonzero elements in z                  # activated experts (|K| = k)
+          x_hat_high <- D z                                      # High-level reconstruction
+          x_hat_low <- 0                                         # Initialize low-level reconstruction
+          for j in K:                                            # Only process activated experts
+              x_sub_j <- Pi_down_j @ x                            # Project to expert j's subspace
+              z_j <- LeakyReLU_alpha(E_j @ x_sub_j)                # Low-level encoding (TopK_1, see below)
+              x_hat_sub_j <- D_j @ z_j                             # Reconstruct in subspace
+              x_hat_low <- x_hat_low + Pi_up_j @ x_hat_sub_j        # Project back and accumulate
+          x_hat <- x_hat_high + x_hat_low                         # Combined reconstruction
+          return x_hat, z, {z_j for j in K}
+
+      function ComputeLoss(x, x_hat, z, {z_j for j in K}):
+          L_recon <- || x - x_hat ||_2^2
+          L_top_recon <- || x - D z ||_2^2
+          L_recon <- L_recon + beta * L_top_recon                # Encourage meaningful top-level features
+          L_sparse <- ||z||_1 + sum_{j in K} ||z_j||_1
+          L_ortho <- || D E - diag(D E) ||_F / (n^2 - n)          # NOTE: box prints "DE"; the
+                                                                  # separately-numbered Eq. 3.4 in the
+                                                                  # body text gives the same penalty as
+                                                                  # || E D - diag(E D) ||_F / (m_top^2 -
+                                                                  # m_top) -- see missing_but_critical
+                                                                  # for how to resolve this discrepancy
+          L <- L_recon + lambda_1 * L_ortho + lambda_2 * L_sparse
+          return L
+
+    mathematical_formulation:
+      - equation: "SAE_k(x) = D TopK_k( LeakyReLU_alpha( E(x - b) ) )"
+        equation_number: "Eq. 2.1, Section 2 (baseline top-k SAE, Gao et al. 2024)"
+        where:
+          x: "input activation in R^d"
+          E: "encoder matrix"
+          D: "decoder matrix"
+          b: "bias vector"
+          k: "sparsity hyperparameter (number of preserved top activations)"
+          alpha: "LeakyReLU threshold = 1/sqrt(d) (=1/sqrt(pi*d) per paper notation p_{1/d}; treated as a small positive threshold below which the LeakyReLU has a small negative slope)"
+          note: "this is the BASELINE architecture compared against, not the paper's own H-SAE; H-SAE's own forward pass (Algorithm 1) notably omits the bias subtraction (x - b) present here, per the paper's actual experimental configuration."
+
+      - equation: "L_recon = || x - SAE_k(x) ||_2^2"
+        equation_number: "Eq. 2.2, Section 2 (baseline SAE reconstruction loss)"
+
+      - equation: "H-SAE(x) = sum_{j in TopKIndices_k} [ z_j * d_j + Pi_up_j @ SAE1_j( Pi_down_j @ x ) ]"
+        equation_number: "Eq. 3.1, Section 3.1"
+        where:
+          TopKIndices_k: "indices of the top-k activated high-level (expert) features"
+          d_j: "the j-th high-level (top-level) decoder feature/column"
+          z_j: "= (LeakyReLU_alpha(E x))_j, the high-level code for expert j (no bias subtraction, matching Algorithm 1)"
+          SAE1_j: "the expert-specific low-level autoencoder for expert j, using TopK_1 over its m_low sublatents -- i.e. exactly ONE low-level sublatent is retained per activated expert"
+          Pi_down_j: "down-projection matrix (dimension s) mapping the input into expert j's low-dimensional subspace"
+          Pi_up_j: "up-projection matrix mapping expert j's subspace reconstruction back to the original d-dimensional space"
+          x_hat_high: "= sum_{j in TopKIndices_k} z_j * d_j (the first term -- high-level reconstruction)"
+          x_hat_low: "= sum_{j in TopKIndices_k} Pi_up_j @ SAE1_j(Pi_down_j @ x) (the second term -- low-level/expert reconstruction)"
+          note: "TopK_1 for the low-level SAE encodes the idea that a subordinate concept sits at a SPECIFIC VERTEX of the polytope representing its parent categorical concept (Park et al. 2024 geometric theory, Section 3.1 'Hierarchical Geometry') -- i.e. within an activated expert, only its single strongest-activating sublatent contributes."
+
+      - equation: "Cost_forward = O(m_top*d) + O(k*s*d) + O(k*m_low) + O(k*m_low*s) + O(k*s*d) + O(k*d)"
+        equation_number: "unnumbered display, Section 3.1 ('Computational Efficiency')"
+        where:
+          m_top: "number of high-level features (experts)"
+          d: "input activation dimensionality"
+          s: "subspace dimension per expert"
+          m_low: "number of low-level features (sublatents) per expert"
+          k: "sparsity level (number of activated experts, i.e. the top-level TopK)"
+          note: "the six terms correspond to: high-level encoding, subspace down-projection, low-level encoding, low-level decoding, subspace up-projection, high-level decoding. In the typical regime k << m_top and s << d, cost is dominated by the O(m_top*d) high-level encoding term, i.e. adding hierarchy costs asymptotically almost nothing extra over a plain top-level SAE of the same size."
+
+      - equation: "L_recon = || x - H-SAE(x) ||_2^2 + beta * || x - x_hat_high ||_2^2"
+        equation_number: "Eq. 3.3, Section 3.2 ('Reconstruction Loss')"
+        where:
+          beta: "top-level-only reconstruction weight, set to 0.1 in main experiments ('chosen because the top-level SAE alone has less capacity than the full H-SAE')"
+          x_hat_high: "= D z, the reconstruction using ONLY the high-level/top-level SAE (no expert contributions)"
+
+      - equation: "L_ortho = || E D - diag(E D) ||_F / (m_top^2 - m_top)"
+        equation_number: "Eq. 3.4, Section 3.2 ('Auxiliary Losses', bi-orthogonality penalty)"
+        where:
+          diag(E D): "the diagonal matrix formed from the diagonal elements of E D (the m_top x m_top matrix of encoder-i-dot-decoder-j inner products for the TOP-LEVEL SAE only)"
+          "|| . ||_F": "Frobenius norm"
+          note: "pushes the encoder direction of feature i and decoder direction of feature j to be orthogonal whenever i != j, i.e. discourages semantic redundancy among TOP-LEVEL features only (not applied to low-level/expert sublatents). NOTE the Algorithm-1-box notation prints this penalty with the factors in the opposite order, 'D E' instead of 'E D' -- since matrix multiplication is not commutative, this is an internal inconsistency in the paper; Eq. 3.4 is the separately-numbered, more deliberately presented version and is treated as authoritative here (see missing_but_critical)."
+
+      - equation: "L_sparse = ||z||_1 + sum_{j in K} ||z_j||_1"
+        equation_number: "unnumbered (given in Algorithm 1's ComputeLoss and referenced in Section 3.2 'Auxiliary Losses')"
+        where:
+          note: "an L1 penalty on ALL latent values (both top-level z and every activated expert's low-level z_j), including values outside the top-k selection, 'to further encourage specialization'."
+
+      - equation: "L = L_recon + lambda_1 * L_ortho + lambda_2 * L_sparse"
+        equation_number: "Eq. 3.2, Section 3.2 (final H-SAE training objective)"
+        where:
+          lambda_1: "orthogonality penalty coefficient, = 0.1 in main experiments"
+          lambda_2: "sparsity (L1) penalty coefficient, = 0.001 in main experiments"
+
+    step_by_step_breakdown:
+      1. "Encode x through the TOP-LEVEL SAE only (no bias subtraction) with LeakyReLU + TopK_k, giving the sparse high-level code z and its k active expert indices K."
+      2. "Compute the high-level (top-level-only) reconstruction x_hat_high = Dz -- this alone is also used as an auxiliary reconstruction target (L_top_recon) to keep top-level features individually meaningful."
+      3. "For each of the k activated experts j in K only (mixture-of-experts sparsity: inactive experts are never computed at all, not just masked to zero): project x down into expert j's low-dimensional subspace (dimension s) via Pi_down_j, encode with a LOCAL LeakyReLU (no separate bias), and apply TopK_1 to retain only the single strongest low-level sublatent."
+      4. "Decode that single low-level sublatent within the subspace, then project back up to the full d-dimensional space via Pi_up_j, and accumulate into x_hat_low."
+      5. "Combine x_hat = x_hat_high + x_hat_low as the final reconstruction."
+      6. "Compute the multi-term loss: full reconstruction error, a beta-weighted top-level-only reconstruction error, an L1 sparsity penalty over all (top- and low-level) latent values, and a bi-orthogonality penalty restricted to the top-level encoder/decoder pair."
+
+    implementation_details:
+      - "H-SAE's own top-level encoding step (in Algorithm 1) does NOT subtract a bias before encoding, unlike the generic baseline SAE_k formula (Eq. 2.1) which does -- this matches the paper's stated experimental choice (Section 4: 'we do not subtract any mean vector nor include a bias term ... as we found this decreased training stability') and should be treated as the actual behavior to implement, not Eq. 2.1's bias-subtracting form."
+      - "The mixture-of-experts sparsity is a REAL computational saving, not just a masking trick: only the k activated experts' down-projection/encoder/decoder/up-projection matrices need to be materialized/computed per forward pass -- this is the source of the paper's claimed compute-efficiency gains (the O(...) cost breakdown)."
+      - "Each expert's low-level SAE always uses TopK_1 (a single active sublatent per activated expert), REGARDLESS of the total number of sublatents per expert (m_low, e.g. 16 or 64 in the main experiments) -- this is a fixed architectural choice, not a tunable hyperparameter of the low-level TopK."
+      - "The projection matrices Pi_down_j (d -> s) and Pi_up_j (s -> d) are UNCONSTRAINED trainable matrices -- the paper explicitly does not impose idempotence or orthogonality/symmetry between them ('we do not impose idempotence or symmetry and simply use 2 trainable matrices'), unlike a literal linear projection/its pseudo-inverse."
+      - "Vectors are normalized to unit norm before being fed to the SAE (both baseline and H-SAE), following Lieberum et al. (2024) convention, but WITHOUT centering/mean-subtraction (see above)."
+      - "Weight initialization, encoder/decoder tying, and other architectural minutiae for E, D, E_j, D_j are not specified beyond 'standard practice' -- treat as standard SAE random init (see missing_but_critical)."
+
+  supporting_algorithms:
+    - algorithm_name: "Baseline TopK SAE"
+      section: "Section 2, Eq. 2.1-2.2 (Gao et al. 2024)"
+      algorithm_box: "No explicit box; given as two equations."
+      pseudocode: |
+        Input: x in R^d, encoder E, decoder D, bias b, sparsity k, threshold alpha
+        Output: reconstruction SAE_k(x)
+
+        pre_activation = LeakyReLU_alpha(E (x - b))
+        z = TopK_k(pre_activation)          # keep top-k values, zero the rest
+        return D z
+      mathematical_formulation:
+        - equation: "SAE_k(x) = D TopK_k(LeakyReLU_alpha(E(x-b)))"
+          equation_number: "Eq. 2.1"
+      implementation_details:
+        - "Used as the comparison baseline throughout Section 4's experiments (reconstruction, interpretability, absorption, cross-lingual redundancy) at matched top-level dictionary sizes."
+        - "alpha (LeakyReLU threshold) = 1/sqrt(d) per the paper's notation p_{1/d} (interpreted as a small positive threshold value scaling with 1/sqrt(d), consistent with standard TopK-SAE LeakyReLU-threshold conventions used to stabilize gradients below the activation threshold)."
+
+  components:
+    - component_name: "Top-level SAE (E, D)"
+      purpose: "Standard sparse autoencoder capturing the binary 'is this high-level concept active' feature, per Park et al. (2024)'s geometric theory of categorical concepts (a parent feature indicating concept presence)."
+      architecture:
+        input: "x in R^d (Gemma 2-2B layer-20 residual-stream activation, unit-normalized, no bias/mean subtraction)"
+        layers:
+          - "Encoder E (d -> m_top), LeakyReLU_alpha activation, TopK_k selection"
+          - "Decoder D (m_top -> d)"
+        output: "sparse code z in R^{m_top} (k nonzero entries) and reconstruction x_hat_high = Dz"
+      special_features:
+        - "Relatively small number of features compared to a flat/standard SAE of equivalent total capacity (per the paper, m_top can be much smaller than the effective total dictionary size m_top * m_low)."
+
+    - component_name: "Per-expert down/up projection (Pi_down_j, Pi_up_j)"
+      purpose: "Maps the full-dimensional input into and out of expert j's low-dimensional subspace (dimension s), representing the low-rank polytope subspace associated with a categorical concept (Park et al. 2024)."
+      architecture:
+        input: "x in R^d (down), or the expert's low-level reconstruction x_hat_sub_j in R^s (up)"
+        layers:
+          - "Pi_down_j: unconstrained trainable matrix, R^d -> R^s"
+          - "Pi_up_j: unconstrained trainable matrix, R^s -> R^d"
+        output: "x_sub_j in R^s (down); contribution to x_hat_low in R^d (up)"
+      special_features:
+        - "One independent (Pi_down_j, Pi_up_j) pair PER top-level expert j (m_top pairs total)."
+        - "No idempotence/symmetry constraint imposed between the pair."
+
+    - component_name: "Per-expert low-level SAE (E_j, D_j)"
+      purpose: "Models the different possible 'values' of expert j's categorical concept (e.g., different dog breeds under the 'dog' concept) as a small SAE operating entirely within the s-dimensional subspace."
+      architecture:
+        input: "x_sub_j = Pi_down_j @ x, in R^s"
+        layers:
+          - "Encoder E_j (s -> m_low), LOCAL LeakyReLU activation (no separate bias term), TopK_1 selection"
+          - "Decoder D_j (m_low -> s)"
+        output: "z_j in R^{m_low} (exactly 1 nonzero entry when computed, since only activated experts run this at all) and x_hat_sub_j = D_j z_j in R^s"
+      special_features:
+        - "Only instantiated/computed for the k CURRENTLY ACTIVE experts per forward pass (mixture-of-experts sparsity) -- this is both an architectural and a computational-efficiency choice."
+        - "m_low (sublatents per expert): 16 or 64 in main experiments; subspace dimension s is coupled to this choice (s=4 when m_low=16, s=8 otherwise)."
+
+  training_details:
+    training_loop:
+      outer_iterations: "Full training run over 1 billion residual-stream vectors (Gemma 2-2B layer 20, multilingual Wikipedia), for 4 epochs, batch size 32,512 -- approximately 1,000,000,000 * 4 / 32,512 ~= 123,032 steps total (derived, not stated directly as a step count in the paper)."
+      inner_iterations: "Each step: one forward/backward/optimizer-update pass over one batch."
+
+      steps:
+        1. "Sample a batch of pre-collected, pre-shuffled, unit-normalized residual-stream vectors (batch size 32,512)."
+        2. "Run Algorithm 1's ForwardPass to get x_hat, z, {z_j}_{j in K}."
+        3. "Run Algorithm 1's ComputeLoss to get L (with warmed-up lambda_1, lambda_2, and beta coefficients during the first 1000 steps)."
+        4. "Backpropagate; Adam optimizer step with global gradient-norm clipping at 0.75."
+        5. "Track an EMA (over 300 batches, ~1M tokens) of each latent's activation frequency, for monitoring the dead-latent rate (though, unlike the baseline TopK SAE, H-SAE does not use a separate auxiliary dead-latent loss -- the orthogonality penalty is observed to serve this role empirically)."
+
+      loss_functions:
+        - name: "L_recon (combined + top-level-only reconstruction)"
+          formula: "L_recon = ||x - H-SAE(x)||_2^2 + beta * ||x - x_hat_high||_2^2"
+          components: "Full model reconstruction error plus a beta=0.1-weighted top-level-only reconstruction error, to keep top-level features individually meaningful rather than purely a routing mechanism."
+        - name: "L_ortho (top-level bi-orthogonality)"
+          formula: "L_ortho = ||ED - diag(ED)||_F / (m_top^2 - m_top)"
+          components: "Penalizes non-zero off-diagonal encoder-decoder inner products among TOP-LEVEL features only; empirically found to strongly mitigate dead top-level atoms (used INSTEAD OF the standard TopK-SAE auxiliary dead-latent loss)."
+        - name: "L_sparse (L1 on all latents)"
+          formula: "L_sparse = ||z||_1 + sum_{j in K} ||z_j||_1"
+          components: "Small additional L1 penalty on top-level and (for activated experts) low-level latent VALUES (not just the top-k selection), to further encourage specialization."
+        - name: "L (total training objective)"
+          formula: "L = L_recon + lambda_1 * L_ortho + lambda_2 * L_sparse"
+          components: "lambda_1 = 0.1, lambda_2 = 0.001 in main experiments; both lambda_1, lambda_2, and beta are warmed up linearly from 0 over the first 1000 steps."
+
+      optimization:
+        optimizer: "Adam (b1 = 0.9; b2 not stated -- [INFERRED] standard default 0.999)"
+        learning_rate: "peak 5e-4, initialized at 1e-11, 1000-step linear warmup, then cosine decay over the remainder of training"
+        gradient_norm: "global norm clipping at 0.75"
+        batch_size: 32512
+        other: "Regularizer coefficients (lambda_1, lambda_2, and implicitly beta) also warm up linearly from 0 over the first 1000 steps, alongside the learning rate warmup."
+
+  all_hyperparameters:
+    # Data (Appendix A.1)
+    training_vectors: 1_000_000_000
+    target_model: "Gemma 2-2B"
+    target_layer: 20
+    activation_site: "residual stream"
+    corpus: "Wikipedia (20231101 dump), multilingual (English + 128 largest non-English Wikipedias, proportional to active users)"
+    tokens_per_article: 256
+    total_english_tokens_selected: 500_000_000
+    normalization: "unit norm, NO mean subtraction, NO bias term"
+    epochs: 4
+
+    # Architecture (Section 4, Appendix A.2)
+    top_level_dict_sizes_tested: [8000, 16000, 32000]  # "8, 16, 32 (Thousands of Top-Level Latents)"
+    top_level_topk_k: 32
+    sublatents_per_expert_tested: [16, 64]
+    subspace_dim_s: {sublatents_16: 4, sublatents_64: 8}
+    low_level_topk: 1  # architecturally fixed, not swept
+
+    # Loss coefficients (Appendix A.2)
+    orthogonality_coefficient_lambda1: 0.1
+    top_level_recon_coefficient_beta: 0.1
+    l1_coefficient_lambda2: 0.001
+    baseline_aux_dead_latent_coefficient: 0.0333333  # 1/30, BASELINE TopK SAE only, not used by H-SAE
+
+    # Optimizer (Appendix A.2)
+    optimizer: "Adam"
+    adam_b1: 0.9
+    adam_b2: "Not specified in paper [INFERRED default: 0.999]"
+    grad_clip_global_norm: 0.75
+    peak_learning_rate: 5e-4
+    initial_learning_rate: 1e-11
+    warmup_steps: 1000
+    lr_schedule_after_warmup: "cosine decay over the remainder of training"
+    regularizer_warmup_steps: 1000
+
+    # Training dynamics (Appendix A.3)
+    dead_latent_ema_window_batches: 300  # roughly 1,000,000 tokens
+    batch_size: 32512
+
+    # Ablation-specific settings (Appendix B.2, unembedding-matrix experiments -- SEPARATE from main experiments)
+    ablation_top_level_dict_size: 2048
+    ablation_sublatents_per_expert: 32
+    ablation_topk_k: 5
+    ablation_l1_strength: 0.0025
+    ablation_orthogonality_penalty: 0.025
+    ablation_steps: 5000
+    ablation_batch_size: 8192
+    ablation_lr_initial: "8192e-15 (as printed in the paper; unusual notation, see missing_but_critical)"
+    ablation_lr_peak: "8192e-6 (as printed in the paper; unusual notation, see missing_but_critical)"
+    ablation_vocab_total: 256128
+    ablation_vocab_filtered: 186032
+    ablation_preprocessing: "whiten the unembedding matrix by multiplying by the inverse square root of its covariance matrix (causal/whitened inner product, Park et al. 2024) -- found necessary for meaningful features"
+
+    # Evaluation settings (Section 4, 4.1)
+    saebench_used_for: ["CE loss score", "explained variance", "first-letter classification absorption benchmark"]
+    cross_lingual_test_sequences: 1000
+    cross_lingual_sequence_token_range: [16, 48]
+    cross_lingual_translation_model: "Gemini-2.0-Flash"
+    cross_lingual_languages: ["French", "Spanish", "German"]
+    cross_lingual_top_features_compared: 8
+
+    location_references:
+      - "training_vectors / target_model / target_layer / corpus / normalization / epochs: Appendix A.1, Section 4 'Experimental Setup'"
+      - "dict sizes / topk / sublatents / subspace dim: Section 4, Appendix A.2"
+      - "loss coefficients: Appendix A.2"
+      - "optimizer / LR schedule: Appendix A.2"
+      - "dead latent EMA: Appendix A.3"
+      - "ablation hyperparameters: Appendix B.1-B.2"
+      - "evaluation settings: Section 4, 4.1"
+
+  implementation_notes:
+    - "This paper's H-SAE is architecturally a MIXTURE-OF-EXPERTS: unlike the OTHER two hierarchical-SAE papers already implemented in this repo (arxiv.2602.11881-atoms-to-trees-hsae's HSAE and arxiv.2605.07922-tree-sae's Tree SAE, both of which are MULTI-LEVEL FLAT dictionaries with soft/hard gating between adjacent or arbitrary levels), this paper's hierarchy is exactly TWO LEVELS DEEP (top-level experts, and exactly-one-active low-level sublatent per activated expert), with an explicit low-rank SUBSPACE PROJECTION per expert rather than a shared flat decoder space -- this is a genuinely different architectural family and should NOT reuse those repos' code directly, though the overall paper2code repo layout convention (config.py / models / training / data / evaluation) is reused for consistency."
+    - "The low-level SAE's TopK_1 (always exactly one active sublatent per expert) is a hard architectural constraint baked into Eq. 3.1, not a value to sweep."
+    - "Only ACTIVATED experts' low-level SAE + projections are computed at all (true sparse/conditional compute), which is the source of the claimed efficiency gains -- an implementation that always computes all m_top experts and merely masks the inactive ones would not reflect the paper's efficiency claims (though it would be numerically equivalent for the loss/gradients, just wasteful); a correct-and-efficient implementation should gather/index only the active experts' parameters per batch."
+    - "The bi-orthogonality penalty (Eq. 3.4) applies ONLY to the top-level (E, D), not to any per-expert (E_j, D_j) -- this is explicit in the paper's description ('a bi-orthogonality penalty on the top-level features')."
+    - "There is a genuine notational inconsistency between Algorithm 1's loss box (which prints the orthogonality term with 'DE') and the separately-numbered Eq. 3.4 (which uses 'ED'); since D is m_top-columns-by-d and E is m_top-rows-by-d (or the transpose convention could differ), 'DE' as literally read would not even be a well-formed m_top x m_top matrix under the paper's stated dimensions (E: R^{m_top x d}, D: R^{d x m_top} implied by 'x_hat_high = Dz' where z in R^{m_top}), whereas E @ D (m_top x d times d x m_top = m_top x m_top) IS well-formed and matches the 'm_top^2 - m_top' normalizer given in Eq. 3.4. Eq. 3.4's ED form is therefore adopted as authoritative for the implementation (see missing_but_critical)."
+    - "The Appendix B ablation study finds that dropping either the orthogonality loss or the L1 sparsity loss does not qualitatively hurt interpretability/hierarchy on the unembedding-matrix task, but both are kept in the main experiments (orthogonality to reduce dead top-level latents in practice; L1 to allow adaptivity below the fixed top-k cutoff). This suggests these coefficients are not tightly load-bearing and reasonable defaults are acceptable for a reproduction."
+    - "Preprocessing (whitening via inverse-sqrt-covariance) is only used/needed for the UNEMBEDDING-MATRIX ablation experiments (Appendix B), which have a fundamentally non-Euclidean semantic geometry (Park et al. 2024) -- it is NOT part of the main residual-stream-activation training pipeline (Section 4), which trains on raw (unit-normalized) Gemma 2-2B residual-stream activations without whitening."
+
+  missing_but_critical:
+    - "Adam's b2 hyperparameter is not stated (only b1=0.9 and global grad-norm clipping are given). [INFERRED default: 0.999, PyTorch/JAX-optax standard default.]"
+    - "The LeakyReLU negative slope (the 'leaky' part, separate from the threshold alpha) is not given a numeric value anywhere in the paper. [INFERRED: use a small standard slope, e.g. 0.01 or the specific small value used by Gao et al. (2024)'s TopK-SAE reference implementation ('some small negative slope below the threshold'); exposed as a configurable constant.]"
+    - "Weight initialization scheme for E, D, E_j, D_j, Pi_down_j, Pi_up_j is not specified. [INFERRED: standard SAE initialization -- e.g. Kaiming/uniform for encoders, decoder tied to encoder transpose at init then trained independently, matching common SAE implementation conventions (as used in the companion HSAE and Tree SAE repos in this project).]"
+    - "Whether decoder columns/rows are normalized or constrained during training (a common SAE practice, used in both companion papers in this repo) is not mentioned for H-SAE. [INFERRED: since H-SAE explicitly omits bias/centering for training stability reasons, and the paper does not mention decoder renormalization, treat decoder normalization as OPTIONAL/not applied by default here, differing from the other two papers' explicit per-step renormalization; expose as a configurable flag.]"
+    - "The precise total step count is not stated directly (only total training vectors, epochs, and batch size, from which it can be derived: ~123,032 steps for the main experiments). [Derivable, not truly missing, but flagged since it must be computed rather than read off directly.]"
+    - "The ablation-experiment learning-rate values '8192 x 10^-15' (initial) and '8192 x 10^-6' (peak) use an unusual multiplicative notation not explained elsewhere in the paper (main experiments state LR directly as '5e-4', not as a multiple of batch size). [INFERRED: interpret literally as written (8192 * 1e-15 = 8.192e-12 initial, 8192 * 1e-6 = 8.192e-3 peak) since no clearer alternative reading is given; flagged as unusual/possibly paper-specific notation or a typo, exposed as configurable and not treated as authoritative for the MAIN (non-ablation) experiments, which use the much more standard 5e-4 peak / 1e-11 initial values instead.]"
+    - "The Algorithm-1-vs-Eq.-3.4 'DE' vs 'ED' orthogonality-penalty ordering discrepancy (see implementation_notes) -- resolved by adopting Eq. 3.4's E@D form as authoritative, since it is the only one that is dimensionally well-formed under the paper's stated E, D shapes."

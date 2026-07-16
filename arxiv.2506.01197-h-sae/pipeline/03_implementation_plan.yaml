@@ -1,0 +1,261 @@
+complete_reproduction_plan:
+  paper_info:
+    title: "Incorporating Hierarchical Semantics in Sparse Autoencoder Architectures"
+    core_contribution: "A mixture-of-experts SAE architecture (H-SAE) that instantiates Park et al. (2024)'s categorical-concept geometry directly: a sparse top-level SAE selects k active 'expert' concepts, and each active expert runs its own small, TopK=1, low-dimensional-subspace-restricted low-level SAE, giving both large effective dictionary size and large compute savings versus a flat SAE of equivalent capacity."
+
+  # ============================================
+  # Section 1: File Structure
+  # ============================================
+  file_structure: |
+    arxiv.2506.01197-h-sae/
+    ├── pipeline/                        # paper2code intermediate artifacts (this file's siblings)
+    │   ├── 01_algorithm_extraction.yaml
+    │   ├── 02_concept_analysis.yaml
+    │   └── 03_implementation_plan.yaml
+    ├── src/
+    │   └── h_sae/
+    │       ├── __init__.py
+    │       ├── config.py               # all hyperparameters/dataclasses
+    │       ├── models/
+    │       │   ├── __init__.py
+    │       │   ├── topk_sae.py         # baseline TopK SAE (Eq. 2.1-2.2), used as comparison
+    │       │   └── hsae.py             # top-level SAE + per-expert projections/low-level SAEs (Eq. 3.1)
+    │       ├── training/
+    │       │   ├── __init__.py
+    │       │   ├── losses.py           # L_recon, L_ortho, L_sparse, L (Eq. 3.2-3.4) + warmup
+    │       │   └── trainer.py          # training loop (H-SAE or baseline)
+    │       ├── data/
+    │       │   ├── __init__.py
+    │       │   └── activations.py      # synthetic parent+subspace-child dataset + real-model collector
+    │       ├── evaluation/
+    │       │   ├── __init__.py
+    │       │   ├── reconstruction.py   # explained variance / reconstruction-loss comparison
+    │       │   ├── absorption.py       # simplified first-letter-classification-style absorption probe
+    │       │   └── dead_latents.py     # dead top-level latent rate tracking
+    │       └── utils/
+    │           ├── __init__.py
+    │           └── seed.py
+    ├── experiments/
+    │   ├── run_train.py                # train H-SAE (or baseline) end-to-end
+    │   ├── run_eval.py                 # compare H-SAE vs. baseline: reconstruction, dead-latent rate, absorption
+    │   └── run_ablation.py             # orthogonality/L1 on-off ablation (Appendix B.2 spirit)
+    ├── tests/
+    │   └── test_smoke.py               # fast CPU smoke test on synthetic data
+    ├── main.py                         # CLI entry point (train / eval / ablate)
+    ├── pyproject.toml                  # uv project config + dependencies
+    └── README.md                       # usage documentation
+
+  # ============================================
+  # Section 2: Implementation Components
+  # ============================================
+  implementation_components: |
+    ## 1. Models
+
+    ### 1.1 TopKSAE (baseline)
+    - Location: src/h_sae/models/topk_sae.py
+    - Purpose: standard TopK SAE (Eq. 2.1-2.2), used as the comparison baseline throughout.
+    - Formula: SAE_k(x) = D TopK_k(LeakyReLU_alpha(E(x - b))).
+    - Hyperparameters: k=32 (main), dict size in {8000,16000,32000} (source: Section 4, Appendix A.2).
+
+    ### 1.2 HSAE (mixture-of-experts hierarchical SAE)
+    - Location: src/h_sae/models/hsae.py
+    - Purpose: implements Algorithm 1's ForwardPass exactly: top-level TopK_k routing (NO bias
+      subtraction, per implementation_notes in pipeline/01_algorithm_extraction.yaml), then for each
+      of the k active experts only: down-project -> local LeakyReLU + TopK_1 encode -> decode ->
+      up-project -> accumulate.
+    - Pseudocode: see pipeline/01_algorithm_extraction.yaml main_algorithm.pseudocode (verbatim
+      Algorithm 1).
+    - Key equations: Eq. 3.1.
+    - Hyperparameters: m_top in {8000,16000,32000}, k=32, m_low in {16,64}, s in {4,8} (coupled to
+      m_low; source: Appendix A.2).
+    - Implementation notes: gather only the k active experts' (Pi_down_j, E_j, D_j, Pi_up_j)
+      parameters per forward call using `torch.index_select`/advanced indexing on a batched
+      per-expert parameter tensor of shape [m_top, ...], rather than looping in Python over all
+      m_top experts and masking -- this both matches the paper's efficiency claim and keeps the
+      implementation reasonably fast even at the (much smaller, CPU-friendly) synthetic scale used
+      for validation here.
+
+    ## 2. Losses
+
+    ### 2.1 Multi-term H-SAE loss
+    - Location: src/h_sae/training/losses.py
+    - Formulas (Eq. 3.2-3.4):
+      L_recon(x) = ||x - H-SAE(x)||_2^2 + beta * ||x - x_hat_high||_2^2
+      L_ortho    = ||E@D - diag(E@D)||_F / (m_top^2 - m_top)     [Eq. 3.4 form, adopted as authoritative]
+      L_sparse   = ||z||_1 + sum_{j in K} ||z_j||_1
+      L          = L_recon + lambda_1 * L_ortho + lambda_2 * L_sparse
+    - Hyperparameters: beta=0.1, lambda_1=0.1, lambda_2=0.001 (main experiments, source: Appendix A.2).
+    - Implementation notes: lambda_1, lambda_2, and beta all linearly warm up from 0 over the first
+      1000 steps (Appendix A.2); implement as a simple `min(1.0, step/warmup_steps)` multiplier
+      applied to each coefficient inside the trainer, not inside the loss function itself (keeps the
+      loss function pure/testable).
+
+    ## 3. Training
+
+    ### 3.1 Trainer
+    - Location: src/h_sae/training/trainer.py
+    - Steps: per step -> sample batch (unit-normalized activations, NO centering) -> forward
+      (HSAE or TopKSAE) -> compute warmed-up-coefficient loss -> backward -> Adam(b1=0.9, b2=INFERRED
+      0.999) step with global-norm clipping at 0.75 -> LR schedule step (linear warmup then cosine
+      decay) -> update dead-latent EMA tracker.
+    - Hyperparameters: batch_size=32512 (main; overridden by a small_synthetic() config for CPU
+      testing), peak_lr=5e-4, initial_lr=1e-11, warmup_steps=1000 (source: Appendix A.2).
+
+    ## 4. Data
+
+    ### 4.1 Activation Dataset
+    - Location: src/h_sae/data/activations.py
+    - Purpose: (a) real path -- collect Gemma 2-2B layer-20 residual-stream activations over
+      multilingual Wikipedia (decoupled interface, requires user-supplied model/tokenizer/corpus);
+      (b) synthetic path (default here) -- `SyntheticParentChildActivations`, generating activations
+      as (parent direction) + (a child-in-subspace direction drawn from a LOW-RANK per-parent
+      subspace), directly mirroring Park et al. (2024)'s "child = parent + child-in-context" geometry
+      that Eq. 3.1 is designed to exploit -- so training + evaluation can be smoke-tested on CPU with
+      a dataset whose true generative structure actually matches what H-SAE is built to find.
+
+    ## 5. Evaluation
+
+    ### 5.1 Reconstruction comparison
+    - Location: src/h_sae/evaluation/reconstruction.py
+    - Metric: 1 - explained variance, for both H-SAE and the baseline TopK SAE at matched top-level
+      dictionary size, per Section 4 "Reconstruction".
+
+    ### 5.2 Simplified absorption probe
+    - Location: src/h_sae/evaluation/absorption.py
+    - Purpose: a synthetic-data-appropriate simplification of SAEBench's first-letter classification
+      absorption benchmark (Section 4.1): given synthetic data with a KNOWN ground-truth
+      parent-concept label per sample, train a linear probe for that label, and measure what
+      fraction of the probe's direction is explained by a single SAE feature vs. requiring multiple
+      features (lower = less splitting/absorption, mirroring the paper's metric).
+
+    ### 5.3 Dead top-level latent rate
+    - Location: src/h_sae/evaluation/dead_latents.py
+    - Purpose: tracks the EMA-based dead-latent rate described in Appendix A.3, to validate the
+      orthogonality loss's empirically-observed dead-latent-reduction effect (Appendix B.2).
+
+  # ============================================
+  # Section 3: Validation Approach
+  # ============================================
+  validation_approach: |
+    ## 1. Unit Tests
+    - [ ] HSAE.forward gathers exactly k experts' parameters per batch element and every activated
+          expert's low-level code has exactly one nonzero entry (TopK_1 architectural invariant).
+    - [ ] L_ortho evaluates to (near) zero for an orthogonal top-level (E, D) pair on a
+          hand-constructed example, and to a positive value for a non-orthogonal one.
+    - [ ] L_recon's top-level-only term (beta * ||x - x_hat_high||^2) depends only on (E, D, z), not
+          on any expert/low-level parameters, verified by gradient-flow inspection on a toy example.
+    - [ ] The coefficient warmup schedule returns 0 at step 0 and 1.0 (i.e. the full configured
+          value) at and after `warmup_steps`.
+
+    ## 2. Integration Tests
+    - [ ] Full HSAE (small m_top, small m_low/s) trains for a few hundred steps on
+          `SyntheticParentChildActivations` without NaNs/Infs and with decreasing combined
+          reconstruction loss.
+    - [ ] Overfitting test: train on a small synthetic dataset with a known small number of
+          parent/child combinations for enough steps that explained variance approaches 1.0.
+
+    ## 3. Paper Result Reproduction (scaled down; full scale needs Gemma 2-2B + 1B Wikipedia vectors)
+    - Run: `uv run python experiments/run_train.py --steps 300` (synthetic, CPU, seconds).
+    - Run: `uv run python experiments/run_eval.py --steps 300` to compare H-SAE vs. baseline TopK SAE
+      reconstruction quality and dead-latent rate at matched top-level dictionary size, expecting
+      H-SAE to reconstruct better (mirrors Figure 3's qualitative direction) given its extra,
+      conditionally-computed low-level capacity.
+    - Run: `uv run python experiments/run_ablation.py --steps 300` to compare dead-latent rate and
+      reconstruction with/without the orthogonality and L1 losses (mirrors Appendix B.2's ablation
+      spirit, though on activation data here rather than the unembedding matrix).
+    - The paper's full-scale numeric targets (Figure 3, Figure 5 and its table) are recorded in
+      pipeline/01_algorithm_extraction.yaml / 02_concept_analysis.yaml for anyone running the real
+      Gemma 2-2B configuration on suitable hardware.
+
+    ## 4. Success Criteria
+    - [ ] `tests/test_smoke.py` passes on CPU in well under a minute.
+    - [ ] At matched top-level dictionary size, H-SAE achieves lower (better) 1-explained-variance
+          than the baseline TopK SAE on synthetic data with true parent+child-subspace structure.
+    - [ ] The orthogonality loss measurably reduces the dead top-level latent rate relative to a run
+          with lambda_1=0, on a small-scale run.
+
+  # ============================================
+  # Section 4: Environment Setup
+  # ============================================
+  environment_setup: |
+    ## Python Version
+    - Python 3.10+ (uv recommended)
+
+    ## Package Management (using uv)
+    ```bash
+    uv init --no-readme --name h-sae
+    uv add torch numpy scikit-learn pyyaml tqdm
+    uv add --optional real-models transformers datasets
+    uv run python main.py --help
+    ```
+
+    ## Core Dependencies
+    ```
+    torch>=2.1.0
+    numpy>=1.24.0
+    scikit-learn>=1.3.0     # LogisticRegression for the simplified absorption probe
+    pyyaml>=6.0
+    tqdm>=4.66.0
+    ```
+
+    ## Optional Dependencies
+    ```
+    transformers, datasets   # only needed for real Gemma 2-2B + Wikipedia activation collection
+    ```
+
+    ## Hardware Requirements
+    - Smoke tests / synthetic-data validation: any CPU, seconds to a couple of minutes.
+    - Full-scale reproduction (Gemma 2-2B, dict sizes up to 32k, 1B training vectors, batch 32512):
+      the paper trains on an 8xA100 node; well out of scope for this development environment. The
+      codebase supports it (via the real-activation-collection interface) but it is not executed
+      here.
+
+    ## Dataset Preparation
+    - Synthetic path (default, used for tests/validation here): generated in-memory, no download.
+    - Real path (optional, user-supplied): multilingual Wikipedia text + Gemma 2-2B (HuggingFace
+      `google/gemma-2-2b`) to extract layer-20 residual-stream activations from.
+
+  # ============================================
+  # Section 5: Implementation Strategy
+  # ============================================
+  implementation_strategy: |
+    ## Phase 1: Foundation (first)
+    1. pyproject.toml + src/h_sae/config.py — hyperparameters as dataclasses with paper defaults.
+    2. src/h_sae/utils/seed.py — seeding helper.
+
+    Validation: config loads and instantiates with defaults.
+
+    ## Phase 2: Core Models
+    3. src/h_sae/models/topk_sae.py — baseline TopK SAE (Eq. 2.1-2.2).
+    4. src/h_sae/models/hsae.py — mixture-of-experts H-SAE forward pass (Eq. 3.1, Algorithm 1).
+
+    Validation: unit tests for shapes, TopK_1 invariant, and gathered-experts-only computation.
+
+    ## Phase 3: Losses & Training Pipeline
+    5. src/h_sae/training/losses.py — L_recon, L_ortho, L_sparse, L, with warmup helper.
+    6. src/h_sae/data/activations.py — synthetic parent+child-subspace generator + real collector stub.
+    7. src/h_sae/training/trainer.py — training loop (works for either HSAE or TopKSAE).
+
+    Validation: overfitting test on synthetic data; loss-component unit tests.
+
+    ## Phase 4: Evaluation & Experiments
+    8. src/h_sae/evaluation/reconstruction.py — explained variance comparison.
+    9. src/h_sae/evaluation/absorption.py — simplified absorption probe.
+    10. src/h_sae/evaluation/dead_latents.py — dead top-level latent rate.
+    11. experiments/run_train.py, experiments/run_eval.py, experiments/run_ablation.py.
+    12. main.py — CLI entry point.
+    13. tests/test_smoke.py — end-to-end CPU smoke test.
+
+    Validation: H-SAE-vs-baseline comparison on synthetic data; smoke test passes.
+
+    ## Phase 5: Documentation (last)
+    14. README.md — usage instructions, scope/limitations note (no full-scale Gemma 2-2B run
+        performed in this environment), pointers to pipeline/01_algorithm_extraction.yaml's targets.
+
+    ## Handling Missing Details
+    - Adam b2: use the standard default 0.999 (documented INFERRED default).
+    - LeakyReLU negative slope: use a small standard value (e.g. 0.01), exposed as a config constant.
+    - Weight initialization: standard Kaiming/uniform encoder init, decoder tied at init then trained
+      independently (matching the conventions used in the two companion repos in this project).
+    - Decoder normalization: NOT applied by default (the paper does not mention it for H-SAE, and
+      explicitly avoids centering/bias for stability reasons), exposed as an optional config flag.
