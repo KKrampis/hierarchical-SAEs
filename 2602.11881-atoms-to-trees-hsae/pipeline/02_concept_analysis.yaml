@@ -1,0 +1,295 @@
+comprehensive_paper_analysis:
+  executive_summary:
+    paper_title: "From Atoms to Trees: Building a Structured Feature Forest with Hierarchical Sparse Autoencoders"
+    core_contribution: "HSAE: jointly trains a series of SAEs of increasing dictionary size while explicitly learning parent-child feature relationships between adjacent levels, turning 'feature splitting' into a deliberate hierarchical indexing structure (a 'conceptual forest') instead of treating it as a defect."
+    implementation_complexity: "High"
+    estimated_components: 8  # per-level JumpReLU SAE, HSAE multi-level wrapper, hierarchy manager (assignment/quantile filter/similarity), dynamic sparsity controller, training loop (alternating optimization), evaluation suite (statistical metrics), SAEBench-style feature-quality benchmarks, AutoInterp LLM-judge pipeline
+
+  complete_structure_map:
+    title: "From Atoms to Trees: Building a Structured Feature Forest with Hierarchical Sparse Autoencoders"
+
+    sections:
+      1_introduction:
+        main_claims: |
+          LLMs capture the intrinsic structure of natural language, and "feature splitting" in
+          SAEs (broad concepts decomposing into finer sub-features as dictionary size grows) is
+          evidence of an underlying hierarchical conceptual structure rather than a nuisance to
+          be engineered away. The paper proposes HSAE, which jointly learns a series of SAEs and
+          explicit parent-child relationships between their features, forming a tree-structured
+          "conceptual forest" while preserving standard SAE reconstruction/interpretability
+          quality.
+        problem_definition: |
+          Standard SAEs identify monosemantic features in isolation with no structure between
+          them, even though evidence (spatial clustering, co-activation hub-and-spoke topologies,
+          feature splitting) suggests LLM representations are organized hierarchically. The goal
+          is to design an SAE training procedure that *discovers and enforces* this latent
+          hierarchy (parent -> children feature relationships across dictionary-size levels)
+          without sacrificing reconstruction fidelity or feature interpretability.
+
+      2_related_work:
+        key_comparisons: |
+          (2.1) Prior work on structure in model activations: parallelogram/linear representation
+          hypothesis (Mikolov et al.; Park et al. 2023) motivating SAEs (Bricken et al. 2023;
+          Cunningham et al. 2023); spatial/multi-scale clustering (Li et al. 2025); circular
+          manifolds (Engels et al. 2025); co-activation hub-and-spoke topologies (Clarke et al.
+          2024).
+          (2.2) Feature splitting / absorption / composition (Bricken et al. 2023; Chanin et al.
+          2024; Anders et al. 2024) — HSAE reframes splitting as a hierarchy signal instead of a
+          defect, in contrast to Matryoshka SAEs (Bussmann et al. 2025) and other works
+          (Chanin et al. 2025; Korznikov et al. 2025) that treat splitting as a problem to
+          suppress.
+          (2.3) SAE architecture evolution: L1/ReLU SAEs (Bricken et al. 2023; Cunningham et al.
+          2023) -> Gated SAEs (Rajamanoharan et al. 2024a) -> TopK/BatchTopK (Gao et al. 2025;
+          Bussmann et al. 2024) -> JumpReLU SAEs (Rajamanoharan et al. 2024b, the base
+          architecture HSAE builds on) -> p-annealing (Karvonen et al. 2024) -> Switch SAEs
+          (Mudide et al. 2025) -> Meta-SAEs (Leask et al. 2025) -> Matryoshka SAEs (Bussmann et
+          al. 2025, the closest prior structural approach, compared/contrasted throughout).
+
+      3_method:
+        subsections:
+          3.0: "Formal SAE_l definition, feature function f_{l,i}, parent-child index sets C_(l,i), disjointness/tree constraint (unnumbered intro to Section 3)"
+          3.1: "Loss Function — per-level L_SAE,l, parent-children constraint loss L_PC, total L_HSAE"
+          3.2: "Parent-Children Feature Perturbation — Bernoulli-gated mixing of a feature's own output with its children's summed output during loss computation"
+          3.3: "Optimization Strategy — alternating optimization (Parameter Optimization stage / Hierarchy Update stage); Similarity-Based Hierarchy Update; Partial Tree Structure (quantile filtering)"
+        algorithms_presented:
+          - "HSAE joint training via alternating optimization (main algorithm, Section 3.1 + 3.3)"
+          - "Parent-Children Feature Perturbation (Section 3.2)"
+          - "Similarity-Based Hierarchy Update (Section 3.3)"
+          - "Partial Tree Structure / quantile-based filtering (Section 3.3)"
+          - "Dynamic Sparsity Control / adaptive lambda_l (Appendix A.2)"
+
+      4_experiments:
+        environments: |
+          Residual-stream activations from: gemma2-2b (Riviere et al., 2024) layer 13 (primary,
+          used for all main-text results unless noted), plus layers 6 and 20 (Appendix E); and
+          qwen3-4b (Yang et al., 2025) layer 18 (Appendix E, cross-model generalization).
+          Activation-collection dataset: mini-PILE (Kaddour, 2023), both a training split
+          (100M activations) and a separate testing split (used for AutoInterp example
+          sampling, Appendix C). SAEBench evaluation additionally uses OpenWebText for some
+          Table 1 metrics (noted discrepancy vs. Table 3 in Appendix E).
+        baselines: |
+          "Baseline" = independently trained standard JumpReLU SAEs at each of the same
+          dictionary sizes (2048/4096/8192/16384), with a hierarchy constructed *post-hoc* using
+          the same similarity-based assignment strategy as HSAE's Hierarchy Update step, but
+          applied after independent training rather than co-evolved with it. This isolates the
+          effect of *joint* training vs. *post-hoc* structure discovery. Additional ablation
+          baselines: "w/o Constraint" (HSAE without L_PC term), "w/o Perturbation" (HSAE without
+          the Bernoulli feature-mixing mechanism), and tree-topology variants "Fix Tree" (static
+          hierarchy after early initialization), "Full Tree" (mandatory parent assignment for
+          every feature), "Binary Tree" (max 2 children per parent).
+        metrics: |
+          (a) Parent-Child Alignment via logical-OR reconstruction Hamming distance (lower =
+          better); (b) P(activ_parent | activ_child) — parent-given-child conditional activation
+          probability (higher = better, "hierarchical necessity"); (c) P(activ_child |
+          activ_parent) — child-given-parent conditional activation probability (higher = better,
+          "coverage/relevance"); (d) AutoInterp — LLM-judge (Qwen3-Max) binary
+          valid-hierarchical-relationship classification rate (higher = better); (e) standard SAE
+          quality via SAEBench (Karvonen et al., 2025): L0, Variance Explained, Absorption (report
+          1 - score), AutoInterp (per-feature interpretability, distinct from the pairwise
+          hierarchy AutoInterp above), RAVEL (disentanglement), SCR (spurious correlation
+          removal), Sparse Probing.
+
+      5_results:
+        main_findings: |
+          HSAE consistently and substantially outperforms the post-hoc baseline on all four
+          hierarchy-consistency metrics (Figure 3): lower Hamming distance, higher
+          parent-given-child and child-given-parent conditional probabilities, higher AutoInterp
+          agreement rate. HSAE matches or exceeds baseline SAEs on standard SAE-quality
+          benchmarks (Table 1) across all four dictionary sizes, notably improving Absorption at
+          larger dictionary sizes. Ablations (Figure 4) confirm both the structural constraint
+          loss and the random perturbation mechanism are independently necessary, and jointly
+          best (Hamming distance 21.3 full HSAE vs. 29.7 without constraint). Tree-topology
+          ablation (Figure 9) shows the flexible Partial Tree design outperforms Binary Tree
+          (22.8), Fix Tree (24.2), and Full Tree (24.0). Geometric analysis (Figure 5/10, UMAP)
+          shows sibling features cluster spatially closer than unrelated features, without an
+          increase in raw co-activation rate (disentangled, not redundant). Multi-child root
+          features show 2.49% higher AutoInterp scores than single-child roots (Figure 11),
+          comparable to quadrupling dictionary size in a standard SAE.
+        tables_figures: |
+          Table 1 (SAEBench-style HSAE vs. Baseline at 4 dictionary sizes) — key reproduction
+          target. Table 2 (mapping of reported benchmark names to exact SAEBench metric
+          identifiers) — needed to correctly wire up SAEBench for evaluation. Table 3 (Appendix E,
+          cross-layer/cross-model/cross-sparsity generalization) — secondary reproduction target.
+          Figure 3 (hierarchy-consistency metrics, HSAE vs. post-hoc baseline) — primary novel
+          contribution to reproduce. Figure 4 (ablation of constraint/perturbation mechanisms) —
+          numeric values given in text (21.3 / 29.7 / ~22.2). Figure 7 (similarity-metric
+          ablation) — qualitative ("all three comparable"), no exact numbers extracted. Figure 8
+          (hyperparameter sweep over rho and r) — qualitative trade-off curves, no exact numbers
+          extracted beyond the chosen operating point (rho=0.01, r=0.05). Figure 9 (tree-topology
+          ablation) — numeric values given in text (21.3 / 22.8 / 24.0 / 24.2). Figures 1, 2, 6
+          (qualitative case-study visualizations of the learned feature forest) — useful as
+          end-to-end "does my pipeline discover sensible hierarchies" sanity checks but not
+          strictly reproducible as exact numbers (they are qualitative/illustrative).
+
+  method_architecture:
+    method_name: "Hierarchical Sparse Autoencoder (HSAE)"
+
+    core_components:
+      component_1:
+        name: "Per-level JumpReLU SAE (SAE_l)"
+        purpose: "Standard 2-layer sparse autoencoder responsible for reconstructing activations at one dictionary-size 'level' of the hierarchy; L of these are trained jointly."
+        paper_section: "Section 3 (unnumbered intro), building on Rajamanoharan et al. (2024b)"
+
+      component_2:
+        name: "Parent-Children Constraint Loss module (L_PC)"
+        purpose: "Computes the structural loss that pulls a parent feature's output toward the sum of its assigned children's outputs, at every level except the last; implements the paper's 'explicit' structural mechanism."
+        paper_section: "Section 3.1"
+
+      component_3:
+        name: "Parent-Children Feature Perturbation module"
+        purpose: "Stochastically substitutes a feature's own contribution with the summed contribution of its children (Bernoulli-gated) when computing the SAE reconstruction loss, implementing the paper's 'implicit' structural mechanism."
+        paper_section: "Section 3.2"
+
+      component_4:
+        name: "Hierarchy Manager (Similarity-Based Hierarchy Update + Partial Tree filter)"
+        purpose: "Periodically (every 5000 steps) recomputes the parent-child assignment {C_(l,i)} from current encoder/decoder vectors, using a configurable similarity metric and a bottom-20%-quantile exclusion filter to allow some features to remain unassigned."
+        paper_section: "Section 3.3"
+
+      component_5:
+        name: "Dynamic Sparsity Controller"
+        purpose: "Feedback controller that adaptively adjusts the per-level L0 penalty weight lambda_l during training to keep the average L0 tracking a target sparsity, replacing static sparsity-weight scheduling."
+        paper_section: "Appendix A.2"
+
+      component_6:
+        name: "Alternating Optimization Trainer"
+        purpose: "Orchestrates training by alternating between Parameter Optimization stages (gradient descent on SAE weights with structure fixed) and Hierarchy Update stages (recomputing structure with weights fixed), so the two co-evolve."
+        paper_section: "Section 3.3"
+
+      component_7:
+        name: "Hierarchy-Consistency Evaluation Suite"
+        purpose: "Computes the paper's novel evaluation metrics for a learned hierarchy: logical-OR Hamming distance, parent-given-child / child-given-parent conditional activation probabilities, and orchestrates the post-hoc baseline construction for comparison."
+        paper_section: "Section 4.2, 4.2's Baselines paragraph"
+
+      component_8:
+        name: "AutoInterp Hierarchy-Judge Pipeline"
+        purpose: "Samples parent-child feature pairs, retrieves top-activating and probability-weighted example sequences for each feature, formats them with activation highlighting, and queries an LLM judge (Qwen3-Max) to classify whether a valid hierarchical relationship holds."
+        paper_section: "Section 4.3, Appendix C"
+
+    component_interactions:
+      - "Component 1 (per-level SAEs) feeds its per-feature outputs f_{l,i}(x) into both Component 2 (L_PC loss) and Component 3 (perturbation), which together modify what gets passed into the reconstruction loss L_SAE,l."
+      - "Component 4 (Hierarchy Manager) reads the current encoder/decoder vectors from Component 1 and writes the children-set assignment {C_(l,i)} that Components 2 and 3 both consume."
+      - "Component 5 (Dynamic Sparsity Controller) reads the batch-level L0 statistics of Component 1's activations and writes back the lambda_l values used inside L_SAE,l."
+      - "Component 6 (Alternating Optimization Trainer) is the orchestration loop that calls Component 1's forward/backward pass + Components 2/3/5 every step, and calls Component 4 every 5000 steps."
+      - "Components 7 and 8 are offline/evaluation-time consumers of a trained HSAE (or of a Baseline HSAE-shaped structure built post-hoc from independently trained SAEs) — they do not participate in training."
+
+    theoretical_foundation:
+      key_insight: |
+        Feature splitting (a broad SAE feature decomposing into several more specific features as
+        dictionary size grows) is not training noise or a defect to engineer away — it is direct
+        evidence that the model's concept space is itself organized hierarchically. If that is
+        true, then *explicitly* modeling and enforcing parent-child structure between SAEs of
+        increasing dictionary size (rather than inferring structure post-hoc from independently
+        trained SAEs) should recover a more faithful, more semantically coherent hierarchy while
+        not harming standard SAE quality metrics.
+      why_it_works: |
+        Two complementary training-time mechanisms operationalize the "parent = distilled
+        abstraction of children" intuition: (1) an explicit loss term that literally forces a
+        parent's output to match the sum of its children's outputs (a functional/algebraic
+        constraint), and (2) a stochastic mechanism that trains the model to reconstruct
+        correctly whether it uses a parent's own feature or the sum of its children's features
+        (a redundancy/interchangeability constraint). Because both mechanisms operate *during*
+        training rather than after, and because the hierarchy is periodically recomputed from
+        the co-evolving feature geometry (alternating optimization) rather than fixed once, the
+        learned features and the learned structure can mutually adapt to each other.
+
+  implementation_requirements:
+    algorithms_to_implement:
+      - algorithm: "HSAE joint training (alternating optimization: parameter optimization + hierarchy update)"
+        section: "Section 3.1, 3.3; Appendix A.1"
+        complexity: "Complex"
+        dependencies: ["Per-level JumpReLU SAE", "Parent-Children Constraint Loss", "Parent-Children Feature Perturbation", "Similarity-Based Hierarchy Update", "Partial Tree filter", "Dynamic Sparsity Control"]
+
+      - algorithm: "Parent-Children Feature Perturbation"
+        section: "Section 3.2"
+        complexity: "Simple"
+        dependencies: ["current children-set assignment {C_(l,i)}", "per-feature outputs f_{l,i}(x)"]
+
+      - algorithm: "Similarity-Based Hierarchy Update"
+        section: "Section 3.3"
+        complexity: "Medium"
+        dependencies: ["trained encoder/decoder vectors", "(optional) EMA co-activation statistics"]
+
+      - algorithm: "Partial Tree quantile filtering"
+        section: "Section 3.3"
+        complexity: "Simple"
+        dependencies: ["max-similarity scores from Similarity-Based Hierarchy Update"]
+
+      - algorithm: "Dynamic Sparsity Control"
+        section: "Appendix A.2"
+        complexity: "Medium"
+        dependencies: ["per-batch L0 statistics per level"]
+
+    models_to_build:
+      - model: "JumpReLU SAE (single level)"
+        architecture_location: "Section 3 intro; base architecture from Rajamanoharan et al. (2024b)"
+        purpose: "Encode an activation vector into a sparse, non-negative-thresholded feature vector and decode back to a reconstruction; the fundamental building block of every HSAE level."
+
+      - model: "HSAE (multi-level wrapper)"
+        architecture_location: "Section 3 (whole section)"
+        purpose: "Owns L JumpReLU SAE instances plus the hierarchical assignment state; exposes joint forward/loss computation across all levels."
+
+    data_processing:
+      - pipeline: "Activation collection from a target LLM"
+        requirements: |
+          Run the target LLM (e.g. gemma2-2b) forward over text from mini-PILE, tokenized to
+          sequence length 1024; extract the residual-stream activation at the target layer/site
+          for every non-BOS token position; accumulate until 100M activation vectors are
+          collected; normalize each vector with a constant scaler so the RMS norm expectation
+          equals sqrt(d).
+
+      - pipeline: "Batch sampling for training"
+        requirements: "Sample mini-batches of 1024 activation vectors (with replacement or via shuffled epochs) from the pre-collected activation dataset for each training step."
+
+      - pipeline: "AutoInterp example retrieval"
+        requirements: |
+          For a sampled parent-child feature pair, from a held-out mini-PILE testing split,
+          retrieve the 10 sequences with highest activation for each feature plus 5 additional
+          sequences sampled with probability proportional to activation value; format with
+          <<token>> highlighting of the activating token(s).
+
+    evaluation_suite:
+      - metric: "Parent-Child Alignment (Hamming distance of logical-OR reconstruction)"
+        formula_location: "Section 4.2 ('Hierarchical Consistency via Logical-OR')"
+        purpose: "Measures whether a parent's activation pattern is well-summarized by the logical OR of its children's activation patterns; lower is better."
+
+      - metric: "P(activ_parent | activ_child)"
+        formula_location: "Section 4.2 ('Conditional Co-activation Probabilities')"
+        purpose: "Measures hierarchical necessity: how rarely a child fires without its parent also firing; higher is better."
+
+      - metric: "P(activ_child | activ_parent)"
+        formula_location: "Section 4.2 ('Conditional Co-activation Probabilities')"
+        purpose: "Measures average semantic relevance/coverage of children within a parent's activation footprint; higher is better."
+
+      - metric: "AutoInterp hierarchy-judge agreement rate"
+        formula_location: "Section 4.3; Appendix C"
+        purpose: "LLM-judged fraction of sampled parent-child pairs classified as a genuine hierarchical relationship; higher is better."
+
+      - metric: "SAEBench suite: L0, Variance Explained, Absorption, per-feature AutoInterp, RAVEL, SCR, Sparse Probing"
+        formula_location: "Section 4.4; Appendix D; Table 2 (exact SAEBench metric-name mapping)"
+        purpose: "Standard SAE-quality benchmarks used to confirm HSAE does not sacrifice reconstruction/interpretability relative to ordinary SAEs."
+
+  reproduction_roadmap:
+    phase_1: |
+      Implement the core per-level JumpReLU SAE, the HSAE multi-level wrapper with a
+      placeholder/empty hierarchy, the parent-children constraint loss, and the feature
+      perturbation mechanism; validate on a small synthetic or small-scale activation dataset
+      that training runs, losses decrease, and reconstructions are sane.
+    phase_2: |
+      Implement the Similarity-Based Hierarchy Update, the Partial Tree quantile filter, and the
+      Dynamic Sparsity Control mechanism; wire them into an alternating-optimization training
+      loop; validate that a full 4-level HSAE trains end-to-end on real (or scaled-down) LLM
+      activation data and produces a non-trivial hierarchy.
+    phase_3: |
+      Implement the evaluation suite (Hamming distance, conditional co-activation probabilities),
+      the post-hoc Baseline construction (independently trained SAEs + same similarity-based
+      assignment applied after the fact), the ablation configurations (w/o Constraint, w/o
+      Perturbation, Fix/Full/Binary Tree variants), and (optionally, since it needs external LLM
+      API access) the AutoInterp LLM-judge pipeline; compare against the paper's reported numbers
+      (Hamming distance 21.3 for full HSAE, 29.7 w/o constraint, etc.) as a correctness check.
+
+  validation_checklist:
+    - "[ ] HSAE trains without diverging on a small-scale run (a few thousand steps, small dictionary sizes) and its reconstruction loss decreases."
+    - "[ ] The Hierarchy Update step produces a valid partial tree: children sets are disjoint across parents at the same level, and roughly `partial_tree_exclusion_quantile` (20%) of candidate features end up unassigned."
+    - "[ ] Ablating the constraint loss (rho=0) and/or perturbation (r=0) measurably worsens the Hamming-distance hierarchy-consistency metric relative to full HSAE, replicating the qualitative ordering in Figure 4 (even if not the exact 21.3/29.7 numbers at reduced scale)."
+    - "[ ] The post-hoc Baseline (independent SAEs + post-hoc similarity assignment) is measurably worse than full HSAE on Hamming distance and conditional co-activation probabilities, replicating Figure 3's qualitative direction."
+    - "[ ] Standard SAE-quality metrics (L0 near the target sparsity of 50, Variance Explained) for HSAE are comparable to an equivalently-sized standalone JumpReLU SAE baseline, replicating Table 1's qualitative claim that hierarchy does not come at the cost of reconstruction quality."

@@ -1,0 +1,414 @@
+complete_algorithm_extraction:
+  paper_structure:
+    method_sections: ["3", "3.1", "3.2", "3.3", "4", "Appendix A", "Appendix A.1", "Appendix A.2"]
+    algorithm_count: 5  # (1) core HSAE joint objective/training, (2) parent-children feature perturbation, (3) similarity-based hierarchy update, (4) partial-tree quantile filtering, (5) dynamic sparsity control (adaptive lambda)
+
+  main_algorithm:
+    algorithm_name: "Hierarchical Sparse Autoencoder (HSAE) joint training via alternating optimization"
+    section: "Section 3, 3.1, 3.3"
+    algorithm_box: "No explicit 'Algorithm N' box in the paper; the procedure is described in prose across Section 3.1 (loss) and 3.3 (optimization strategy) plus Appendix A.1 (parameter optimization details)."
+
+    pseudocode: |
+      # Reconstructed from Section 3 and 3.3 prose (paper has no literal Algorithm box)
+      Input: activation dataset D (100M vectors from target LLM), L levels, dictionary
+             sizes n_1 < n_2 < ... < n_L, target sparsity L0_hat, parent-child
+             constraint weight rho = 0.01, perturbation rate r = 0.05,
+             hierarchy-update period = 5000 steps, exclusion quantile q = 0.20
+      Output: trained SAE parameters {e_{l,i}, d_{l,i}, sigma_{l,i}} for l=1..L,
+              and hierarchical assignment {C_{l,i}}
+
+      1. Initialize L independent JumpReLU SAEs, one per level l=1..L, with
+         dictionary sizes n_1,...,n_L (increasing).
+      2. Initialize hierarchical relations {C_{l,i}} (parent-child index sets)
+         arbitrarily / from an initial similarity pass.
+      3. For each training round (alternating optimization):
+         3.1 Parameter Optimization stage (structure {C_{l,i}} held fixed):
+             For a predefined number of gradient steps:
+               a. Sample a batch x ~ D (batch size 1024).
+               b. For each level l, compute the parent-children-perturbed
+                  feature activations f~_{l,i}(x) (see supporting algorithm
+                  "Parent-Children Feature Perturbation").
+               c. Compute SAE_ hat_l(x) = sum_i f~_{l,i}(x) and the per-level
+                  loss L_SAE,l(x) = ||SAE_hat_l(x) - x||_2^2
+                                    + lambda_l * sum_i 1{sigma(e_{l,i}^T x) > 0}.
+               d. Compute the parent-children constraint loss L_PC,(l,i)(x)
+                  for every (l,i) with 1 <= l <= L-1 (see Eq. for L_PC below).
+               e. Compute total loss:
+                  L_HSAE = E_x[ sum_{l=1}^{L} L_SAE,l(x)
+                                + rho * sum_{l=1}^{L-1} sum_i L_PC,(l,i)(x) ].
+               f. Backpropagate with a straight-through estimator through the
+                  L0 sparsity discontinuity; update {e_{l,i}, d_{l,i}} with
+                  Adam (beta1=0, beta2=0.995).
+               g. Renormalize each decoder vector d_{l,i} to fix its norm.
+               h. Apply ghost gradients to revive dead neurons.
+               i. Update the adaptive sparsity weights lambda_l using the
+                  Dynamic Sparsity Control mechanism (see supporting algorithm).
+         3.2 Hierarchy Update stage (model parameters held fixed), performed
+             once every 5000 gradient steps:
+               a. For every feature (l+1, j), compute its similarity to every
+                  candidate parent feature (l, i) at the preceding level using
+                  the chosen similarity metric (default: encoder cosine
+                  similarity; alternatives: decoder cosine similarity or
+                  co-activation probability).
+               b. Assign each child (l+1, j) to the most similar parent (l, i)
+                  (see supporting algorithm "Similarity-Based Hierarchy
+                  Update"), subject to the Partial Tree quantile filter that
+                  leaves the least-similar bottom 20% of features unassigned
+                  (Cl,i = empty set contribution) and to the disjointness
+                  constraint C_(l,i) ∩ C_(l,k) = ∅ for i != k.
+      4. Repeat step 3 (alternating Parameter Optimization / Hierarchy Update)
+         until the training step budget is exhausted.
+      5. Return the trained SAE parameters for all levels and the final
+         hierarchical assignment {C_{l,i}}.
+
+    mathematical_formulation:
+      - equation: "SAE_l(x) = sum_{i=1}^{n_l} d_{l,i} * sigma(e_{l,i}^T x)"
+        equation_number: "unnumbered display equation, Section 3 (before Eq. numbering starts)"
+        where:
+          x: "activation vector in R^d (residual-stream activation of the target LLM)"
+          d_{l,i}: "decoder direction (column) for feature i at level l"
+          e_{l,i}: "encoder direction for feature i at level l"
+          sigma: "JumpReLU-style activation (per-feature threshold omitted from notation for simplicity; threshold differs per feature (l,i))"
+          n_l: "dictionary size (number of features) at level l"
+          L: "number of hierarchy levels (SAEs trained jointly)"
+
+      - equation: "f_{l,i}(x) = d_{l,i} * sigma(e_{l,i}^T x)"
+        equation_number: "unnumbered, Section 3 (defines the single-feature function used later)"
+        where:
+          f_{l,i}(x): "output contribution of a single feature (l,i) to the reconstruction"
+
+      - equation: "C_(l,i) subset of {1, ..., n_{l+1}}"
+        equation_number: "unnumbered, Section 3 (definition of children index set)"
+        where:
+          C_(l,i): "set of indices of children of parent feature (l,i) at the next (finer) level l+1"
+
+      - equation: "C_(l,i) ∩ C_(l,k) = empty_set, for all i != k"
+        equation_number: "unnumbered, Section 3 (tree-structure disjointness constraint)"
+        where:
+          constraint: "child sets of distinct parent features at the same level must be disjoint, so the structure is a partial tree/forest"
+
+      - equation: "L_SAE,l(x) = || SAE_l(x) - x ||_2^2 + lambda_l * sum_{i=1}^{n_l} 1{sigma(e_{l,i}^T x) > 0}"
+        equation_number: "Section 3.1 (unnumbered display, immediately before the parent-children constraint loss)"
+        where:
+          "|| SAE_l(x) - x ||_2^2": "MSE reconstruction loss at level l"
+          lambda_l: "sparsity penalty weight for level l (dynamically adjusted, see Appendix A.2)"
+          "1{sigma(e_{l,i}^T x) > 0}": "indicator of feature i being active (L0 / sparsity penalty term)"
+          note: "paper's summation index is printed as n_i but is understood to be n_l, the dictionary size of level l; treat as n_l ([INFERRED] typo correction)"
+
+      - equation: |
+          L_PC,(l,i)(x) = || f_{l,i}(x) - sum_{j in C_(l,i)} f_{l+1,j}(x) ||_2^2   if C_(l,i) != empty_set
+          L_PC,(l,i)(x) = 0                                                        if C_(l,i) == empty_set
+        equation_number: "Section 3.1 (unnumbered display, 'parent-children constraint loss')"
+        where:
+          L_PC,(l,i): "structural constraint loss for parent feature (l,i): encourages the parent's output to equal the sum of its assigned children's outputs at the next level"
+
+      - equation: "L_HSAE = E_{x~D}[ sum_{l=1}^{L} L_SAE,l(x) + rho * sum_{l=1}^{L-1} sum_{i=1}^{n_l} L_PC,(l,i)(x) ]"
+        equation_number: "Section 3.1 (final HSAE loss, unnumbered display; this is the overall training objective)"
+        where:
+          D: "distribution of activations extracted from the target site of the target LLM"
+          rho: "parent-child constraint weight, set to 0.01 in experiments"
+
+      - equation: "z_{l,i} ~ Bernoulli(r)"
+        equation_number: "Section 3.2 (perturbation gate variable)"
+        where:
+          r: "perturbation rate, set to 5% (0.05) in experiments"
+          z_{l,i}: "independent Bernoulli random variable sampled per feature per training step, gating whether feature (l,i) uses its own activation or its children's summed activation"
+
+      - equation: "f~_{l,i}(x) = z_{l,i} * f_{l,i}(x) + (1 - z_{l,i}) * sum_{j in C_(l,i)} f_{l+1,j}(x)"
+        equation_number: "Section 3.2 (perturbed feature function)"
+        where:
+          f~_{l,i}(x): "perturbed contribution of feature (l,i): either its own output, or (with probability 1-r) the summed output of its children"
+
+      - equation: "SAE_hat_l(x) = sum_{i=1}^{n_l} f~_{l,i}(x)"
+        equation_number: "Section 3.2 (perturbed SAE reconstruction used to compute L_SAE,l during training)"
+        where:
+          SAE_hat_l: "reconstruction of level l computed from perturbed feature outputs; L_SAE,l(x) in the training loop is computed with this perturbed version, not the un-perturbed SAE_l(x)"
+
+      - equation: "Delta_L0 = -eta * (L0 - L0_hat)"
+        equation_number: "Appendix A.2 (target trajectory for average L0, first-order exponential decay process)"
+        where:
+          L0_hat: "target sparsity (average number of active features per level)"
+          eta: "decay rate, set to 0.001 in experiments"
+          L0: "current (EMA-tracked) average L0 of a level, tracked with momentum 0.999"
+
+    step_by_step_breakdown:
+      1. "Parameter Optimization stage: with the hierarchical structure {C_{l,i}} fixed, run standard gradient-descent SAE training (Adam, straight-through L0 gradient estimator, decoder renormalization, ghost gradients, adaptive sparsity weight) for a predefined number of steps, using the perturbed reconstruction f~ instead of the raw f for computing L_SAE,l, and adding the parent-children constraint loss L_PC weighted by rho."
+      2. "Hierarchy Update stage: with model parameters fixed, recompute the parent assignment for every feature at level l+1 by finding its most similar feature at level l under the chosen similarity metric, subject to the bottom-20% quantile exclusion filter (partial tree) and to disjointness of children sets across different parents."
+      3. "Alternate stages 1 and 2 throughout training (structure updated every 5000 gradient steps) so that feature parameters and hierarchical assignment co-evolve."
+
+    implementation_details:
+      - "Each SAE_l is a standard two-layer JumpReLU SAE (Rajamanoharan et al., 2024b); the per-feature threshold parameter of sigma is omitted from the paper's notation for simplicity but differs per feature (l,i)."
+      - "The hierarchy index l does NOT correspond to depth in a multilayer neural network — it indexes SAE 'levels' (dictionary-size tiers), each of which is itself only a two-layer (encoder/decoder) SAE."
+      - "Straight-through estimator used for the gradient through the L0 sparsity penalty's discontinuity."
+      - "Decoder vectors d_{l,i} are renormalized (unit-norm-fixed) after every gradient step."
+      - "Ghost gradients (Jermyn & Templeton, 2024) are used to mitigate the dead-neuron problem."
+      - "Adaptive/dynamic sparsity weight lambda_l (the paper's 'only notable modification' relative to standard JumpReLU SAE training) — see Dynamic Sparsity Control supporting algorithm."
+      - "Hierarchy update performed once every 5000 gradient steps (not every step)."
+      - "Parent-child constraint weight rho = 0.01 and perturbation rate r = 5% are the values used in all main experiments, chosen via the ablation results in Figure 8 to balance hierarchical alignment against reconstruction fidelity."
+      - "Activation vectors are normalized with a constant scaler so that the RMS norm expectation equals sqrt(d) before training (standard SAE preprocessing)."
+      - "BOS-token-position activations are excluded from the training/collection dataset."
+
+  supporting_algorithms:
+    - algorithm_name: "Parent-Children Feature Perturbation"
+      section: "Section 3.2"
+      algorithm_box: "No explicit box; described in prose with equations."
+      pseudocode: |
+        Input: perturbation rate r, feature outputs f_{l,i}(x) for all levels/features,
+               children sets C_(l,i)
+        Output: perturbed feature outputs f~_{l,i}(x) used to compute L_SAE,l
+
+        For each training step, for each feature (l,i) with l < L:
+          1. Sample z_{l,i} ~ Bernoulli(r) independently for every feature.
+          2. If z_{l,i} == 1: f~_{l,i}(x) = f_{l,i}(x)                      (use own output)
+             Else:            f~_{l,i}(x) = sum_{j in C_(l,i)} f_{l+1,j}(x) (use children's summed output)
+          3. SAE_hat_l(x) = sum_i f~_{l,i}(x); use this in place of SAE_l(x)
+             when computing L_SAE,l(x) for this training step.
+      mathematical_formulation:
+        - equation: "z_{l,i} ~ Bernoulli(r); f~_{l,i}(x) = z_{l,i} f_{l,i}(x) + (1-z_{l,i}) sum_{j in C_(l,i)} f_{l+1,j}(x)"
+          equation_number: "Section 3.2"
+          where:
+            r: "perturbation rate = 0.05"
+      implementation_details:
+        - "z_{l,i} random variables are sampled independently across features at each training step (not shared / not fixed across a batch)."
+        - "Purpose: treats parent and children contributions as interchangeable during reconstruction, exposing L_SAE,l to mixtures across adjacent levels and thereby encouraging parent/child consistency."
+
+    - algorithm_name: "Similarity-Based Hierarchy Update"
+      section: "Section 3.3 ('Similarity-Based Hierarchy Update')"
+      algorithm_box: "No explicit box; described in prose."
+      pseudocode: |
+        Input: trained encoder/decoder vectors {e_{l,i}, d_{l,i}} for all levels,
+               (optionally) EMA co-activation statistics, exclusion quantile q=0.20
+        Output: updated children sets {C_(l,i)}
+
+        For each level l from 1 to L-1:
+          For each feature (l+1, j) at the next (finer) level:
+            1. Compute similarity(  (l+1,j), (l,i) ) for every candidate parent
+               (l,i) at level l, using the chosen metric:
+                 - default: cosine similarity between encoder vectors e_{l+1,j}
+                   and e_{l,i} ("Encoder" variant, used throughout the paper)
+                 - alternative: cosine similarity between decoder vectors
+                   d_{l+1,j} and d_{l,i} ("Decoder" variant)
+                 - alternative: co-activation probability between features
+                   (l+1,j) and (l,i), estimated via an exponential moving
+                   average over training examples ("Co-activ" variant)
+            2. Let s_max(l+1,j) = max_i similarity((l+1,j), (l,i)).
+          Compute the bottom-q quantile threshold of {s_max(l+1,j)} over all
+          features (l+1, j) at level l+1 (q = 0.20, i.e. bottom 20th percentile).
+          For each feature (l+1, j):
+            3. If s_max(l+1,j) is below the quantile threshold: leave (l+1,j)
+               unassigned (it becomes an "independent" feature with no parent;
+               it does not appear in any C_(l,i)).
+            4. Else: assign (l+1,j) to its most-similar parent (l, i*) =
+               argmax_i similarity((l+1,j), (l,i)); add j to C_(l,i*).
+          Enforce (by construction of the assignment / as a downstream
+          consistency check) that C_(l,i) ∩ C_(l,k) = empty_set for i != k
+          (each child assigned to exactly one parent, forming a partial
+          tree/forest rather than a DAG).
+      implementation_details:
+        - "Empirically HSAE is largely insensitive to which similarity metric is used (all three give comparable ablation results, Figure 7); Encoder-vector cosine similarity is used as the default throughout the paper because it is the most direct and computationally efficient to compute within the training pipeline."
+        - "Co-activation similarity requires tracking a running proportion of jointly-active training examples between feature pairs via an exponential moving average (EMA) — this is more expensive than a direct vector cosine similarity."
+
+    - algorithm_name: "Partial Tree Structure (quantile-based filtering)"
+      section: "Section 3.3 ('Partial Tree Structure')"
+      algorithm_box: "No explicit box; folded into the Hierarchy Update description above, listed separately here because the paper treats it as a distinct design element / tunable hyperparameter."
+      pseudocode: |
+        Input: max-similarity scores s_max(l+1,j) for all children candidates
+               at level l+1, exclusion quantile q (default 0.20)
+        Output: subset of features at level l+1 that remain unassigned (no
+                parent) versus assigned into some C_(l,i)
+
+        1. Compute the q-th percentile (default 20th percentile) of the
+           distribution of s_max(l+1,j) values across all candidate features
+           at level l+1.
+        2. Any feature whose s_max falls at or below that percentile is
+           excluded from the hierarchy (treated as an independent /
+           atomic feature with no parent).
+        3. All other features are assigned to their highest-similarity
+           parent as in the Similarity-Based Hierarchy Update.
+      implementation_details:
+        - "This relaxation avoids forcing every feature into a parent-child relationship — some features capture idiosyncratic/atomic concepts that do not naturally belong under any coarser parent."
+        - "The exclusion quantile is a tunable hyperparameter, set to 20% (q=0.20) in all reported experiments."
+        - "Ablation (Appendix F.3, Figure 9) shows this Partial Tree design outperforms 'Full Tree' (forcing every feature to have a parent, Hamming distance 24.0) and 'Fix Tree' (freezing the hierarchy early and never updating it, Hamming distance 24.2); full HSAE (partial tree + alternating updates) achieves Hamming distance 21.3."
+
+    - algorithm_name: "Dynamic (Adaptive) Sparsity Control"
+      section: "Appendix A.2"
+      algorithm_box: "No explicit box; described in prose with one equation."
+      pseudocode: |
+        Input: target sparsity L0_hat (= 50 in main experiments), decay rate
+               eta = 0.001, EMA momentum m = 0.999, per-level current sparsity
+               weight lambda_l (initial value not stated in paper — treat as
+               a standard SAE initial sparsity coefficient, [INFERRED])
+        Output: updated lambda_l at every training step, for every level l
+
+        Maintain, for each level l, an EMA-tracked estimate of the current
+        average L0: L0_ema <- m * L0_ema + (1 - m) * L0_batch
+        (L0_batch = observed average number of active features in the
+        current training batch at level l).
+
+        At each training step:
+          1. Compute the theoretical target change in L0 from the first-order
+             exponential decay model:
+                 Delta_L0_target = -eta * (L0_ema - L0_hat)
+          2. Compute the actual observed change in L0_ema since the previous
+             step: Delta_L0_observed = L0_ema(t) - L0_ema(t-1).
+          3. If Delta_L0_observed indicates sparsity is decreasing (L0
+             falling) faster than Delta_L0_target predicts: decrease lambda_l
+             (less sparsity pressure needed).
+          4. Else, if the model remains denser than the target trajectory
+             expects (L0 not falling fast enough / still above target):
+             increase lambda_l (more sparsity pressure needed).
+          5. Use the (possibly clipped/step-sized, exact update rule not
+             specified numerically in the paper — [INFERRED] a small
+             multiplicative or additive step is implied by "velocity-based
+             control") adjusted lambda_l for the next training step's
+             L_SAE,l computation.
+      mathematical_formulation:
+        - equation: "Delta_L0 = -eta * (L0 - L0_hat)"
+          equation_number: "Appendix A.2"
+          where:
+            eta: "decay rate = 0.001"
+            L0_hat: "target sparsity = 50 (main experiments)"
+      implementation_details:
+        - "L0 is tracked via an exponential moving average (EMA) with momentum 0.999 to filter high-frequency per-batch noise."
+        - "This is a feedback/velocity-based controller: it compares the *observed* rate of change of L0 against the theoretically expected rate of change under the first-order exponential decay target trajectory, then increases/decreases lambda_l accordingly."
+        - "The paper states this significantly reduces training oscillations compared to the control method in Karvonen et al. (2025), but does not give the exact numeric update-step formula for lambda_l itself — implementers should use a standard proportional feedback update (e.g. lambda_l *= exp(k * sign_or_magnitude(Delta_L0_observed - Delta_L0_target)) or similar) and treat the exact constant as [INFERRED]/tunable."
+
+  components:
+    - component_name: "Per-level JumpReLU SAE (SAE_l)"
+      purpose: "Standard two-layer sparse autoencoder used independently at each of the L hierarchy levels; encodes activation x into a sparse feature vector and decodes back to a reconstruction."
+      architecture:
+        input: "x in R^d — a single residual-stream activation vector from the target LLM (d = 2304 for gemma2-2b)"
+        layers:
+          - "Encoder: linear projection e_{l,i}^T x for each feature i (n_l encoder directions total at level l), followed by JumpReLU-style activation sigma with a per-feature learnable threshold (threshold parameter omitted from the paper's simplified notation)"
+          - "Decoder: linear combination sum_i d_{l,i} * sigma(e_{l,i}^T x) of decoder directions weighted by activation strength"
+        output: "reconstruction of x in R^d, plus the sparse feature-activation vector [sigma(e_{l,1}^T x), ..., sigma(e_{l,n_l}^T x)] of dimension n_l"
+      special_features:
+        - "Decoder vectors are renormalized to fixed norm after every gradient step."
+        - "Ghost gradients applied to prevent/resurrect dead features."
+        - "Per-feature adaptive threshold in the JumpReLU activation (standard JumpReLU SAE mechanism, not modified by HSAE)."
+
+    - component_name: "HSAE (collection of L JumpReLU SAEs + hierarchical assignment)"
+      purpose: "The full model: L SAE levels of increasing dictionary size (n_1 < n_2 < ... < n_L) trained jointly, plus a partial-tree parent-child assignment {C_{l,i}} linking features at adjacent levels."
+      architecture:
+        input: "x in R^d (same activation as fed to each individual SAE_l)"
+        layers:
+          - "L independent SAE_l modules (see above), sharing no weights but coupled through the loss function and the hierarchical assignment"
+          - "A non-parametric hierarchical assignment structure {C_(l,i)}, recomputed periodically (every 5000 steps) rather than learned via gradient descent"
+        output: "L reconstructions (one per level) plus the tree/forest of parent-child feature relationships"
+      special_features:
+        - "Dictionary sizes used in main experiments: 2048, 4096, 8192, 16384 (4 levels, L=4)."
+        - "Target sparsity L0 = 50 for every level."
+        - "The hierarchy index l is a dictionary-size tier, not a neural-network depth."
+
+  training_details:
+    training_loop:
+      outer_iterations: "Alternating rounds of (Parameter Optimization stage, Hierarchy Update stage); hierarchy update occurs once every 5000 gradient steps."
+      inner_iterations: "Within each Parameter Optimization stage: a predefined number of gradient-descent steps (exact count not specified in the paper beyond the 5000-step hierarchy-update cadence; total training duration implied by 'training a 4-level HSAE takes approximately 6 hours' on an A800 GPU for d=2304 — [INFERRED] total step count should be treated as a tunable/derived quantity, e.g. sized so the 100M-activation dataset is processed for a reasonable number of epochs)."
+
+      steps:
+        1. "Sample a batch of activations x ~ D (batch size 1024) from the pre-collected 100M-activation dataset."
+        2. "Compute perturbed per-feature outputs f~_{l,i}(x) for every level/feature using the current Bernoulli(r) draws and current children sets {C_{l,i}}."
+        3. "Compute L_SAE,l(x) for every level l using the perturbed reconstruction SAE_hat_l(x)."
+        4. "Compute L_PC,(l,i)(x) for every (l,i) with a non-empty children set."
+        5. "Compute the total loss L_HSAE and backpropagate (straight-through estimator through the L0 discontinuity)."
+        6. "Update SAE parameters with Adam (beta1=0, beta2=0.995); apply cosine LR schedule with 10%-of-steps linear warmup then decay to zero."
+        7. "Renormalize decoder vectors; apply ghost gradients; update adaptive sparsity weights lambda_l via the Dynamic Sparsity Control mechanism."
+        8. "Every 5000 gradient steps: run the Hierarchy Update stage (recompute {C_{l,i}} via Similarity-Based Hierarchy Update + Partial Tree filtering) instead of / in addition to a normal parameter step."
+
+      loss_functions:
+        - name: "L_SAE,l (per-level reconstruction + sparsity loss)"
+          formula: "L_SAE,l(x) = || SAE_hat_l(x) - x ||_2^2 + lambda_l * sum_{i=1}^{n_l} 1{sigma(e_{l,i}^T x) > 0}"
+          components: "MSE reconstruction term (using the perturbed reconstruction SAE_hat_l during training) plus an L0-style sparsity penalty weighted by the adaptively-controlled lambda_l."
+        - name: "L_PC,(l,i) (parent-children structural constraint loss)"
+          formula: "L_PC,(l,i)(x) = || f_{l,i}(x) - sum_{j in C_(l,i)} f_{l+1,j}(x) ||_2^2 if C_(l,i) != empty else 0"
+          components: "Squared error between a parent feature's own output and the sum of its assigned children's outputs at the next level; zero for features with no assigned children."
+        - name: "L_HSAE (total training objective)"
+          formula: "L_HSAE = E_x[ sum_{l=1}^{L} L_SAE,l(x) + rho * sum_{l=1}^{L-1} sum_i L_PC,(l,i)(x) ]"
+          components: "Sum of all per-level SAE losses plus rho-weighted sum of all parent-children constraint losses."
+
+      optimization:
+        optimizer: "Adam (beta1 = 0, beta2 = 0.995)"
+        learning_rate: "Not given as an explicit numeric value in the paper text extracted — [INFERRED] use a standard SAE learning rate such as 3e-4 to 7e-5 range; scheduled per the cosine schedule described below. Treat exact peak LR as a tunable default; record as 'Not specified in paper'."
+        lr_schedule: "Cosine learning-rate scheduler: linear warm-up over the first 10% of training steps, followed by cosine decay to zero."
+        gradient_norm: "Not specified in paper"
+        batch_size: 1024
+        other: "Straight-through gradient estimator through the L0 sparsity discontinuity; decoder vectors renormalized after every step; ghost gradients used to mitigate dead neurons (Jermyn & Templeton, 2024)."
+
+  all_hyperparameters:
+    # Training
+    batch_size: 1024
+    optimizer: "Adam"
+    adam_beta1: 0
+    adam_beta2: 0.995
+    lr_schedule: "cosine, 10% linear warmup then decay to zero"
+    dataset_size: "100,000,000 activation vectors"
+    sequence_length: 1024  # tokens, for prompts used to generate activations
+    exclude_bos_token: true
+    activation_normalization: "constant scaler so RMS norm expectation = sqrt(d)"
+
+    # Architecture
+    num_levels_L: 4
+    dictionary_sizes: [2048, 4096, 8192, 16384]
+    target_sparsity_L0: 50
+    hidden_dim_d_gemma2_2b: 2304
+    sae_type_per_level: "two-layer JumpReLU SAE (Rajamanoharan et al., 2024b)"
+
+    # HSAE-specific
+    parent_child_constraint_weight_rho: 0.01
+    perturbation_rate_r: 0.05  # 5%
+    hierarchy_update_period_steps: 5000
+    partial_tree_exclusion_quantile: 0.20  # bottom 20th percentile excluded from hierarchy
+    default_similarity_metric: "encoder vector cosine similarity"
+    alternative_similarity_metrics: ["decoder vector cosine similarity", "co-activation probability (EMA-tracked)"]
+
+    # Dynamic sparsity control (Appendix A.2)
+    sparsity_control_decay_rate_eta: 0.001
+    sparsity_control_L0_ema_momentum: 0.999
+
+    # Evaluation / experiment settings
+    target_model_default: "gemma2-2b (Riviere et al., 2024)"
+    target_layer_default: 13
+    target_dataset: "mini-PILE (Kaddour, 2023)"
+    additional_layers_tested: [6, 20]
+    additional_model_tested: "qwen3-4b, layer 18 (Yang et al., 2025)"
+    additional_sparsity_levels_tested: [80, 100]
+    llm_judge_model_for_autointerp: "Qwen3-Max"
+    autointerp_feature_pairs_sampled: 5000
+    autointerp_examples_per_feature: "10 highest-activation sequences + 5 sampled proportional to activation value"
+    hardware: "NVIDIA A800 GPUs"
+    approx_training_time_4_level_hsae: "~6 hours (for d=2304, on A800)"
+
+    # Source references
+    location_references:
+      - "batch_size: Appendix A.1 (Training Hyperparameters)"
+      - "adam_beta1/beta2: Appendix A.1"
+      - "lr_schedule: Appendix A.1"
+      - "dictionary_sizes / num_levels_L / target_sparsity_L0: Section 4 (Experimental Setup)"
+      - "hidden_dim_d_gemma2_2b: Appendix A.1 (Computational Resources and Efficiency)"
+      - "parent_child_constraint_weight_rho / perturbation_rate_r: Section 3.2"
+      - "hierarchy_update_period_steps: Section 3.3 ('Similarity-Based Hierarchy Update' paragraph)"
+      - "partial_tree_exclusion_quantile: Section 3.3 ('Partial Tree Structure')"
+      - "default_similarity_metric: Section 3.3"
+      - "sparsity_control_decay_rate_eta / momentum: Appendix A.2"
+      - "target_model_default / target_layer_default / target_dataset: Section 4 (Experimental Setup)"
+      - "additional_layers_tested / additional_model_tested / additional_sparsity_levels_tested: Appendix E"
+      - "llm_judge_model_for_autointerp / autointerp sampling: Appendix C"
+      - "hardware / approx_training_time: Appendix A.1"
+
+  implementation_notes:
+    - "The paper explicitly says the 'only notable modification' to standard JumpReLU SAE training is the adaptive/dynamic sparsity weight (Appendix A.2) — everything else about per-level SAE training (straight-through L0 estimator, decoder renorm, ghost gradients) follows standard JumpReLU SAE practice from Rajamanoharan et al. (2024b)."
+    - "The hierarchy index l is a dictionary-size tier ('level'), not depth in a neural network — each SAE_l is only a 2-layer (encoder/decoder) module."
+    - "The similarity metric ablation (Figure 7) shows the three metrics (co-activation, decoder cosine sim, encoder cosine sim) are nearly interchangeable in final quality; implementers can start with encoder cosine similarity (the paper's default) and treat the others as optional configurable alternatives."
+    - "Ablation results to reproduce as an implementation sanity check (Section 4.5 / Figure 4, Hamming distance, lower is better): Baseline (independent SAEs + post-hoc alignment) is worst, w/o Constraint = 29.7, w/ Constraint but w/o Perturbation ('constraint loss alone') ≈ 22.2 (i.e., 21.3 + 0.9 per the text), full HSAE = 21.3."
+    - "Tree-topology ablation to reproduce (Appendix F.3 / Figure 9, Hamming distance, lower is better): Binary Tree = 22.8, Fix Tree = 24.2, Full Tree = 24.0, HSAE (partial tree, default) = 21.3."
+    - "Main SAE-quality benchmark table (Table 1) gives concrete target numbers (L0, Variance Explained, Absorption, AutoInterp, RAVEL, SCR, Sparse Probing) for HSAE vs. Baseline at each of the 4 dictionary sizes on gemma2-2b layer 13 — useful as reproduction targets once SAEBench-style evaluation is implemented."
+    - "Table 3 (Appendix E) gives additional reproduction targets across layers 6/13/20 of gemma2-2b, qwen3-4b layer 18, and target sparsities 80/100 on gemma2-2b layer 13."
+
+  missing_but_critical:
+    - "Exact peak learning rate value for Adam is not stated numerically in the extracted text (only optimizer betas and the cosine-with-warmup schedule shape are given). [INFERRED default: use a standard SAE learning rate, e.g. 4e-5 to 3e-4, and expose it as a configurable hyperparameter.]"
+    - "Total number of training steps / epochs over the 100M-activation dataset is not given explicitly (only that hierarchy updates happen every 5000 steps and 4-level training takes ~6 hours on an A800). [INFERRED: implementers should expose total_steps as a config value and calibrate against wall-clock/hardware.]"
+    - "The exact numeric update rule (step size / multiplicative factor) for adjusting lambda_l in the Dynamic Sparsity Control mechanism is described qualitatively ('if observed reduction is faster than target, decrease lambda_l; if slower/denser, increase lambda_l') but no formula for the magnitude of adjustment is given. [INFERRED: implement as a simple proportional/velocity feedback controller, e.g. lambda_l *= exp(kappa * (Delta_L0_target - Delta_L0_observed)) with a small tunable kappa, and expose kappa as a hyperparameter; document this as an approximation of the paper's unspecified exact rule.]"
+    - "Initial value of lambda_l (before adaptive control kicks in) is not specified. [INFERRED: use a small positive initial sparsity coefficient, e.g. 1e-2 to 1e-1, consistent with typical SAE L0-penalty warmup practice, and let the dynamic control mechanism adjust it thereafter.]"
+    - "JumpReLU threshold initialization/learning-rate details are not given (paper refers to Rajamanoharan et al., 2024b for the base JumpReLU SAE mechanism rather than restating it). [INFERRED: follow standard JumpReLU SAE defaults — e.g. a learnable per-feature threshold optimized with a straight-through estimator, threshold learning rate possibly distinct from encoder/decoder LR.]"
+    - "Exact prompt count / tokenization details for building the 100M-activation dataset from mini-PILE (beyond sequence length 1024 and BOS exclusion) are not given. [INFERRED: standard next-token-prediction forward passes over mini-PILE text, collecting the specified residual-stream site's activations at every non-BOS position until 100M vectors are collected.]"
+    - "The initial hierarchy assignment before the first Hierarchy Update step (step 2 of the main pseudocode) is not explicitly described. [INFERRED: initialize either as fully unassigned (all Cl,i = empty) until the first update at step 5000, or run an initial similarity pass on randomly-initialized encoders — treat as an implementation choice, default to 'unassigned until first update'.]"

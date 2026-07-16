@@ -1,0 +1,325 @@
+complete_reproduction_plan:
+  paper_info:
+    title: "From Atoms to Trees: Building a Structured Feature Forest with Hierarchical Sparse Autoencoders"
+    core_contribution: "Jointly train a series of JumpReLU SAEs of increasing dictionary size while explicitly learning and enforcing a partial-tree parent-child structure between their features, via a structural constraint loss, a random feature-perturbation mechanism, and an alternating optimization procedure that co-evolves model parameters and hierarchy assignment."
+
+  # ============================================
+  # Section 1: File Structure
+  # ============================================
+  file_structure: |
+    2602.11881-atoms-to-trees-hsae/
+    ├── pipeline/                        # paper2code intermediate artifacts (this file's siblings)
+    │   ├── 01_algorithm_extraction.yaml
+    │   ├── 02_concept_analysis.yaml
+    │   └── 03_implementation_plan.yaml
+    ├── src/
+    │   └── hsae/
+    │       ├── __init__.py
+    │       ├── config.py               # all hyperparameters/dataclasses
+    │       ├── models/
+    │       │   ├── __init__.py
+    │       │   ├── jumprelu_sae.py     # single-level JumpReLU SAE
+    │       │   └── hsae.py             # multi-level HSAE wrapper
+    │       ├── algorithms/
+    │       │   ├── __init__.py
+    │       │   ├── perturbation.py     # parent-children feature perturbation
+    │       │   ├── hierarchy.py        # similarity-based hierarchy update + partial tree
+    │       │   └── sparsity_control.py # dynamic sparsity control (adaptive lambda)
+    │       ├── training/
+    │       │   ├── __init__.py
+    │       │   ├── losses.py           # L_SAE, L_PC, L_HSAE
+    │       │   └── trainer.py          # alternating-optimization training loop
+    │       ├── data/
+    │       │   ├── __init__.py
+    │       │   └── activations.py      # activation dataset + synthetic generator
+    │       ├── evaluation/
+    │       │   ├── __init__.py
+    │       │   ├── hierarchy_metrics.py  # Hamming distance, conditional co-activation probs
+    │       │   ├── baseline.py           # post-hoc baseline hierarchy construction
+    │       │   └── autointerp.py         # LLM-judge hierarchy evaluation (pluggable judge)
+    │       └── utils/
+    │           ├── __init__.py
+    │           └── seed.py             # reproducibility helpers
+    ├── experiments/
+    │   ├── run_train.py                # train an HSAE (or baseline SAEs) end-to-end
+    │   ├── run_eval.py                 # compute hierarchy-consistency + SAE-quality metrics
+    │   └── run_ablation.py             # reproduce Figure 4 / Figure 9 ablation table
+    ├── tests/
+    │   └── test_smoke.py               # fast CPU smoke test on synthetic data
+    ├── main.py                         # CLI entry point (train / eval / ablate)
+    ├── pyproject.toml                  # uv project config + dependencies
+    └── README.md                       # usage documentation
+
+  # ============================================
+  # Section 2: Implementation Components
+  # ============================================
+  implementation_components: |
+    ## 1. Core Models
+
+    ### 1.1 JumpReLUSAE (single level)
+    - Location: src/hsae/models/jumprelu_sae.py
+    - Purpose: encode x -> sparse feature activations -> reconstruct x, for one hierarchy level.
+    - Pseudocode (from pipeline/01_algorithm_extraction.yaml, "Per-level JumpReLU SAE"):
+      ```
+      pre_act = x @ W_enc + b_enc            # shape [B, n_l]
+      feat = JumpReLU(pre_act, threshold)    # per-feature learnable threshold, straight-through grad
+      recon = feat @ W_dec.T + b_dec         # W_dec rows renormalized to unit norm after each step
+      ```
+    - Key equations: SAE_l(x) = sum_i d_{l,i} * sigma(e_{l,i}^T x); f_{l,i}(x) = d_{l,i} * sigma(e_{l,i}^T x).
+    - Hyperparameters: n_l in {2048,4096,8192,16384} (source: Section 4); d = 2304 for gemma2-2b (source: Appendix A.1).
+    - Implementation notes: implement JumpReLU via a straight-through estimator (forward = hard step at
+      learnable per-feature threshold; backward = surrogate gradient, e.g. rectangle/pulse kernel as in
+      Rajamanoharan et al. 2024b). Ghost gradients: track a dead-feature mask (no activation for N steps)
+      and add an auxiliary loss/gradient nudge that resurrects dead directions toward under-reconstructed
+      residuals. Decoder rows renormalized to unit L2 norm after every optimizer step.
+
+    ### 1.2 HSAE (multi-level wrapper)
+    - Location: src/hsae/models/hsae.py
+    - Purpose: owns L JumpReLUSAE instances (increasing dict size) plus the hierarchy assignment state
+      {C_(l,i)} (implemented as, e.g., a per-level integer parent-index tensor of shape [n_{l+1}], with
+      -1 meaning "unassigned"); exposes a forward pass that returns per-level reconstructions and feature
+      activations for loss computation.
+    - Depends on: JumpReLUSAE (1.1), hierarchy assignment format shared with algorithms/hierarchy.py.
+
+    ## 2. Structural Algorithms
+
+    ### 2.1 Parent-Children Feature Perturbation
+    - Location: src/hsae/algorithms/perturbation.py
+    - Formula: z_{l,i} ~ Bernoulli(r); f~_{l,i}(x) = z_{l,i} f_{l,i}(x) + (1-z_{l,i}) sum_{j in C_(l,i)} f_{l+1,j}(x)
+    - Hyperparameters: r = 0.05 (source: Section 3.2).
+    - Implementation notes: operates on the raw per-feature activation*decoder outputs (not yet summed);
+      needs children-set indices from the current hierarchy assignment; for unassigned parents (Cl,i empty)
+      always use the feature's own output (z forced to 1, matching L_PC's "0 if Cl,i empty" convention).
+
+    ### 2.2 Similarity-Based Hierarchy Update
+    - Location: src/hsae/algorithms/hierarchy.py
+    - Purpose: recompute {C_(l,i)} from current encoder (default) or decoder vectors, or from EMA
+      co-activation statistics; assign each level-(l+1) feature to its most similar level-l feature.
+    - Hyperparameters: default metric = "encoder" cosine similarity (source: Section 3.3); alternatives
+      "decoder", "coactivation".
+    - Implementation notes: vectorize via a [n_{l+1}, n_l] cosine-similarity matrix (normalize rows/cols,
+      matmul); argmax over axis=1 gives each child's best parent and its score.
+
+    ### 2.3 Partial Tree Quantile Filter
+    - Location: src/hsae/algorithms/hierarchy.py (same module as 2.2, applied right after argmax)
+    - Formula: exclude children whose max-similarity score is <= the bottom-q quantile of all
+      max-similarity scores at that level (q = 0.20, source: Section 3.3).
+    - Implementation notes: use torch.quantile on the max-similarity score vector; features below the
+      threshold get parent index -1 ("unassigned" / independent feature).
+
+    ### 2.4 Dynamic Sparsity Control
+    - Location: src/hsae/algorithms/sparsity_control.py
+    - Formula: Delta_L0_target = -eta * (L0_ema - L0_hat), eta = 0.001 (source: Appendix A.2);
+      L0_ema updated with momentum 0.999 each step; lambda_l is nudged up/down based on whether the
+      *observed* change in L0_ema this step under- or over-shoots Delta_L0_target.
+    - Implementation notes ([INFERRED], flagged as such in pipeline/01_algorithm_extraction.yaml): implement
+      as `lambda_l *= exp(kappa * (delta_target - delta_observed))` clamped to a reasonable multiplicative
+      range per step (e.g. [0.98, 1.02]) so lambda_l changes smoothly; kappa exposed as a config constant
+      with a conservative default (e.g. 1.0), documented as an approximation since the paper does not give
+      the exact update-rule constant.
+
+    ## 3. Losses
+
+    ### 3.1 L_SAE,l and L_PC,(l,i)
+    - Location: src/hsae/training/losses.py
+    - Formulas:
+      L_SAE,l(x) = ||SAE_hat_l(x) - x||_2^2 + lambda_l * sum_i 1{feat_i > 0}
+      L_PC,(l,i)(x) = ||f_{l,i}(x) - sum_{j in C_(l,i)} f_{l+1,j}(x)||_2^2  (0 if C_(l,i) empty)
+      L_HSAE = E_x[ sum_l L_SAE,l(x) + rho * sum_{l<L} sum_i L_PC,(l,i)(x) ]
+    - Hyperparameters: rho = 0.01 (source: Section 3.2/3.1).
+    - Implementation notes: L_SAE,l uses SAE_hat_l (the *perturbed* reconstruction from 2.1), not the raw
+      SAE_l(x); the L0 indicator term uses a straight-through estimator for its gradient.
+
+    ## 4. Training
+
+    ### 4.1 Alternating Optimization Trainer
+    - Location: src/hsae/training/trainer.py
+    - Steps: per training step -> sample batch -> perturbation (2.1) -> forward all levels -> compute
+      L_HSAE (3.1) -> backward (straight-through through L0) -> Adam step (beta1=0, beta2=0.995) ->
+      renormalize decoders -> ghost-gradient bookkeeping -> dynamic sparsity control update (2.4);
+      every `hierarchy_update_period_steps` (5000) steps, instead run a Hierarchy Update (2.2 + 2.3).
+    - Hyperparameters: batch_size=1024, cosine LR with 10% linear warmup then decay to 0, optimizer
+      Adam(beta1=0, beta2=0.995) (source: Appendix A.1).
+
+    ## 5. Data
+
+    ### 5.1 Activation Dataset
+    - Location: src/hsae/data/activations.py
+    - Purpose: (a) for real experiments, collect residual-stream activations from a HF/TransformerLens
+      model over a text corpus (mini-PILE), excluding BOS positions, RMS-normalized to sqrt(d); (b) for
+      fast local validation (this environment has no GPU/internet budget for a full 100M-activation,
+      ~6h-on-A800 run), also provide a `SyntheticHierarchicalActivations` generator that samples from a
+      small number of latent "ground-truth" clusters with a known tree structure, so the whole pipeline
+      (training + hierarchy-consistency evaluation) can be smoke-tested on CPU in seconds.
+    - Implementation notes: keep the real-activation collector's interface (`collect_activations(model,
+      tokenizer, texts, layer, site, d_model) -> Tensor[N, d]`) decoupled from model loading, so users
+      with GPU/HF access can plug in gemma2-2b / qwen3-4b without touching the rest of the codebase.
+
+    ## 6. Evaluation
+
+    ### 6.1 Hierarchy-Consistency Metrics
+    - Location: src/hsae/evaluation/hierarchy_metrics.py
+    - Metrics: logical-OR Hamming distance (Section 4.2), P(parent|child), P(child|parent)
+      (Section 4.2, "Conditional Co-activation Probabilities").
+    - Implementation notes: operate on boolean activation matrices [N, n_l] per level; compute per
+      assigned (parent, children) pair then average, as described in the paper.
+
+    ### 6.2 Post-hoc Baseline Construction
+    - Location: src/hsae/evaluation/baseline.py
+    - Purpose: train L independent JumpReLUSAEs (no L_PC, no perturbation, no joint hierarchy update
+      during training) then run one Similarity-Based Hierarchy Update (2.2 + 2.3) post-hoc to build a
+      comparison hierarchy, per Section 4.2 "Baselines".
+
+    ### 6.3 AutoInterp Hierarchy Judge
+    - Location: src/hsae/evaluation/autointerp.py
+    - Purpose: sample parent-child pairs, retrieve top/weighted-sampled activating example sequences
+      (Appendix C sampling strategy: 10 top + 5 proportional), format with <<token>> highlighting, and
+      call a pluggable `LLMJudge` interface (default stub raises `NotImplementedError` with instructions;
+      a `Qwen3MaxJudge`-shaped adapter is provided but requires the user's own API credentials) using the
+      exact system/user prompt template quoted in Appendix C.
+
+  # ============================================
+  # Section 3: Validation Approach
+  # ============================================
+  validation_approach: |
+    ## 1. Unit Tests
+    - [ ] JumpReLUSAE.forward produces reconstruction of the same shape as input, and feature
+          activations are non-negative with the expected sparsity behavior at threshold boundaries.
+    - [ ] L_PC returns exactly 0 for a parent with an empty children set, and the correct squared-error
+          value for a synthetic case with a known parent/children output.
+    - [ ] Similarity-Based Hierarchy Update on a toy encoder-vector matrix recovers a hand-verified
+          nearest-parent assignment, and the Partial Tree filter unassigns exactly the intended bottom-q
+          fraction on a synthetic score distribution.
+    - [ ] Dynamic Sparsity Control increases lambda_l when a synthetic L0_ema is held above target and
+          decreases it when held below target.
+    - [ ] Children sets stay pairwise-disjoint after every Hierarchy Update call (tree-structure invariant).
+
+    ## 2. Integration Tests
+    - [ ] Full HSAE (small L=2 or 3, small dictionary sizes, e.g. 32/64/128) trains for a few hundred
+          steps on `SyntheticHierarchicalActivations` without NaNs/Infs and with decreasing L_SAE loss.
+    - [ ] Overfitting test: train on a small (e.g. 2,000-vector) synthetic dataset with a known tree
+          structure for enough steps that Variance Explained approaches 1.0 and the recovered hierarchy's
+          Hamming distance to the ground-truth tree is near 0.
+
+    ## 3. Paper Result Reproduction (scaled-down, since full-scale reproduction needs gemma2-2b + 100M
+       activations + an A800 GPU for ~6h, which is outside this environment's budget)
+
+    ### 3.1 Ablation ordering (qualitative reproduction of Figure 4 / Figure 9)
+    - Expected qualitative result: Hamming distance ordering
+      full HSAE < "w/o Perturbation" < "w/o Constraint" < post-hoc Baseline, and
+      HSAE (partial tree) < Binary Tree ~ Full Tree ~ Fix Tree, on the synthetic benchmark.
+    - Run: `uv run python experiments/run_ablation.py --synthetic` (defaults to CPU-sized config).
+    - The paper's full-scale numbers (Hamming distance: HSAE 21.3, w/o Perturbation ~22.2,
+      w/o Constraint 29.7; tree variants: Binary 22.8, Fix 24.2, Full 24.0) are recorded in
+      pipeline/01_algorithm_extraction.yaml as reproduction targets for anyone running the full-scale
+      gemma2-2b configuration on suitable hardware.
+
+    ### 3.2 Real-scale run (optional, requires GPU + HF model access)
+    - Run: `uv run python experiments/run_train.py --config configs/gemma2_2b_layer13.yaml`
+      (real-activation path; requires the user to supply a HF/TransformerLens-loadable gemma2-2b and
+      mini-PILE text access, neither of which is available in this development environment).
+    - Run: `uv run python experiments/run_eval.py --checkpoint <ckpt>` to compute Hamming distance and
+      conditional co-activation probabilities against the reproduction targets above.
+
+    ## 4. Success Criteria
+    - [ ] `tests/test_smoke.py` passes on CPU in well under a minute.
+    - [ ] Synthetic-data ablation reproduces the paper's qualitative ordering of mechanisms (full HSAE
+          best, removing either mechanism worse, post-hoc baseline worst).
+    - [ ] SAE-quality sanity check: on synthetic data, HSAE's average Variance Explained and L0 are within
+          a small tolerance of an equivalent standalone JumpReLUSAE trained on the same data (hierarchy
+          should not tank reconstruction quality), mirroring Table 1's qualitative claim.
+
+  # ============================================
+  # Section 4: Environment Setup
+  # ============================================
+  environment_setup: |
+    ## Python Version
+    - Python 3.10+ (uv recommended)
+
+    ## Package Management (using uv)
+    ```bash
+    uv init --no-readme --name hsae
+    uv add torch numpy scikit-learn pyyaml tqdm
+    uv add --optional viz umap-learn matplotlib
+    uv add --optional real-models transformers transformer-lens
+    uv run python main.py --help
+    ```
+
+    ## Core Dependencies
+    ```
+    torch>=2.1.0
+    numpy>=1.24.0
+    scikit-learn>=1.3.0     # cosine_similarity utility, optional convenience
+    pyyaml>=6.0             # loading pipeline/*.yaml and experiment configs
+    tqdm>=4.66.0
+    ```
+
+    ## Optional Dependencies
+    ```
+    umap-learn, matplotlib     # for Figure 5/10-style geometric visualization (not required for training/eval)
+    transformers, transformer-lens  # only needed for real-model activation collection (Section 5.1 real path)
+    ```
+
+    ## Hardware Requirements
+    - Smoke tests / synthetic-data validation: any CPU, a few seconds to a couple of minutes.
+    - Full-scale reproduction (gemma2-2b, 4 levels up to 16384, 100M activations): NVIDIA GPU with
+      enough VRAM for gemma2-2b activation extraction plus SAE training (paper uses NVIDIA A800,
+      ~6 hours per run) — out of scope for this environment; the codebase supports it but it is not
+      executed here.
+
+    ## Dataset Preparation
+    - Synthetic path (default, used for tests/validation here): generated in-memory by
+      `SyntheticHierarchicalActivations`, no download needed.
+    - Real path (optional, user-supplied): mini-PILE (Kaddour, 2023) text + a HF/TransformerLens-loadable
+      target LLM (gemma2-2b, qwen3-4b) to extract residual-stream activations from.
+
+  # ============================================
+  # Section 5: Implementation Strategy
+  # ============================================
+  implementation_strategy: |
+    ## Phase 1: Foundation (first)
+    1. pyproject.toml + src/hsae/config.py — all hyperparameters as dataclasses with the paper's defaults.
+    2. src/hsae/utils/seed.py — seeding helper for reproducibility.
+
+    Validation: config loads and instantiates with defaults; seeding is deterministic.
+
+    ## Phase 2: Core Models & Losses
+    3. src/hsae/models/jumprelu_sae.py — single-level SAE with straight-through JumpReLU, ghost grads.
+    4. src/hsae/algorithms/hierarchy.py — similarity-based update + partial-tree filter (needed early
+       since HSAE's forward/loss depends on the assignment format it defines).
+    5. src/hsae/algorithms/perturbation.py — parent-children feature perturbation.
+    6. src/hsae/models/hsae.py — multi-level wrapper tying 3-5 together.
+    7. src/hsae/training/losses.py — L_SAE, L_PC, L_HSAE.
+    8. src/hsae/algorithms/sparsity_control.py — dynamic sparsity control.
+
+    Validation: unit tests for each (shapes, disjointness invariant, zero-case for empty children).
+
+    ## Phase 3: Data & Training Pipeline
+    9. src/hsae/data/activations.py — synthetic generator (required) + real-model collector (optional path).
+    10. src/hsae/training/trainer.py — alternating optimization loop wiring everything together.
+
+    Validation: overfitting test on a small synthetic dataset with a known tree.
+
+    ## Phase 4: Evaluation & Experiments
+    11. src/hsae/evaluation/hierarchy_metrics.py — Hamming distance, conditional co-activation probabilities.
+    12. src/hsae/evaluation/baseline.py — post-hoc baseline construction.
+    13. src/hsae/evaluation/autointerp.py — LLM-judge pipeline (pluggable, optional to actually run).
+    14. experiments/run_train.py, experiments/run_eval.py, experiments/run_ablation.py.
+    15. main.py — CLI entry point dispatching to the experiment scripts.
+    16. tests/test_smoke.py — end-to-end CPU smoke test tying everything together.
+
+    Validation: reproduce the qualitative ablation ordering on synthetic data; smoke test passes.
+
+    ## Phase 5: Documentation (last)
+    17. README.md — usage instructions (uv commands), scope/limitations note (no full-scale gemma2-2b
+        run performed in this environment), and pointers to the paper's reproduction targets recorded in
+        pipeline/01_algorithm_extraction.yaml.
+
+    ## Handling Missing Details
+    - Exact Adam peak learning rate (not given numerically in paper): expose as a config default
+      (e.g. 4e-4) with a comment that it is an inferred/tunable default, not a paper-stated value.
+    - Exact Dynamic Sparsity Control update-step formula (paper only describes the qualitative
+      increase/decrease rule): implement a small proportional/velocity feedback controller with a
+      documented, tunable `kappa` constant, clearly commented as an approximation.
+    - Total training-step budget (paper gives only hierarchy-update cadence and wall-clock time):
+      exposed as a config value (`total_steps`), left for the user to size to their hardware/dataset.
