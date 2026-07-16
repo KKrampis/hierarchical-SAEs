@@ -1,0 +1,283 @@
+comprehensive_paper_analysis:
+  executive_summary:
+    paper_title: "Tree SAE: Learning Hierarchical Feature Structures in Sparse Autoencoders"
+    core_contribution: |
+      Demonstrates that the standard "activation coverage" criterion used by prior work (MCS:
+      Masked Cosine Similarity) to identify parent-child feature pairs post-hoc is insufficient
+      and produces semantically incoherent pairs, and introduces a stronger "reconstruction
+      condition" plus a Tree SAE architecture that encodes tree structure directly within the
+      feature set (via a recursive activation-coverage gate + multi-level reconstruction loss),
+      paired with a dynamic, capacity-aware feature-reallocation mechanism (Algorithms 1-2) to
+      combat dead features caused by the rigid tree structure.
+    implementation_complexity: "High"
+    estimated_components: 7  # flat multi-block TopK SAE, allocation/tree state, recursive activation-coverage
+                              # gate, multi-level reconstruction+aux loss, greedy allocation (Algorithm 1),
+                              # dynamic reallocation (Algorithm 2), hierarchy-consistency evaluation suite
+                              # (activation coverage, reconstruction score, hierarchical pair metric)
+
+  complete_structure_map:
+    title: "Tree SAE: Learning Hierarchical Feature Structures in Sparse Autoencoders"
+
+    sections:
+      1_introduction:
+        main_claims: |
+          Standard SAEs treat features as independent, ignoring the hierarchical structure of
+          real-world concepts, which causes feature absorption, splitting, and composition. Prior
+          hierarchical SAEs (Matryoshka, Matching Pursuit) still learn independent feature sets and
+          rely on the post-hoc "activation coverage" MCS criterion to *identify* hierarchical pairs
+          afterward -- this paper shows that criterion alone is insufficient (produces semantically
+          unrelated "hierarchical" pairs) and proposes a "reconstruction condition" plus a Tree SAE
+          that encodes tree structure directly during training via a dynamic allocation mechanism.
+        problem_definition: |
+          Design an SAE that (a) provably/architecturally enforces a stricter, more semantically
+          faithful notion of parent-child feature relationship than activation coverage alone, and
+          (b) discovers/organizes such relationships during training (not just post-hoc), while
+          remaining competitive with SOTA SAEs (Matryoshka, TopK) on standard reconstruction and
+          hierarchy-pathology (absorption/splitting/composition) benchmarks, and while managing the
+          dead-feature problem introduced by the tree's rigid parent-child capacity constraints.
+
+      2_related_work:
+        key_comparisons: |
+          (Appendix B / Section 2) Base SAE formalization (Bricken et al. 2023; Cunningham et al.
+          2023; Rajamanoharan et al. 2024; Lieberum et al. 2024; Bussmann et al. 2024 BatchTopK).
+          Pathologies: Feature Splitting & Absorption (Chanin et al. 2024), Feature Composition
+          (Anders et al. 2024; Leask et al. 2025). Prior hierarchical SAEs: Matryoshka SAE
+          (Bussmann et al. 2025, closest prior SOTA, multi-level/nested-dictionary reconstruction,
+          the primary baseline throughout); Matching Pursuit SAE / MP-SAE (Costa et al. 2025,
+          conditional-orthogonal features via Matching Pursuit); TopK SAE (Gao et al. 2024, the
+          baseline activation function and auxiliary-loss mechanism this paper builds directly on).
+          MCS (Masked Cosine Similarity, Bricken et al. 2023; Bussmann et al. 2025) is the prior
+          post-hoc hierarchy-detection criterion this paper directly critiques and improves upon.
+
+      3_method:
+        subsections:
+          "2.1": "Preliminary: standard SAE formalization (Eq. 1-3) and the activation-coverage condition (Eq. 4)"
+          "2.2": "Cases Where Activation Coverage Fails (qualitative/empirical motivation for the reconstruction condition)"
+          "3": "Our Proposed Reconstruction Condition (Eq. 5, S_res) and its empirical validation"
+          "4": "Tree Sparse Autoencoder: tree structure (allocation vectors, Eq. 6), training loss (Eq. 7-9), and Obtaining Optimal Feature Allocation (Eq. 10, Theorem 4.1, Algorithms 1-2)"
+        algorithms_presented:
+          - "Tree SAE forward pass with recursive activation-coverage gating (Eq. 6)"
+          - "Multi-level reconstruction + per-layer auxiliary training loss (Eq. 7-9)"
+          - "Algorithm 1: Greedy allocation algorithm (optimal child-count-per-parent via Theorem 4.1)"
+          - "Algorithm 2: Full dynamical feature reallocation algorithm (periodic dead-feature reassignment)"
+
+      4_experiments:
+        environments: |
+          GPT2-small (Radford et al., 2019) layer 5 residual-stream activations, trained on 500M
+          tokens of The Pile (Gao et al., 2020). Main experiment: dictionary size 24576, 2-layer and
+          4-layer Tree SAE / Matryoshka SAE variants, at 4 sparsity levels L0 in {32, 48, 64, 80}.
+          Scaling experiment: dictionary sizes 6144 and 49152, at the smallest proportional L0
+          (8 and 64 respectively), comparing Tree SAE vs. Matryoshka SAE only.
+        baselines: |
+          Four main SAEs compared throughout: Tree SAE (this paper), Matryoshka SAE (Bussmann et
+          al. 2025, the primary SOTA hierarchical baseline), Matching Pursuit SAE / MP-SAE (Costa
+          et al. 2025), and plain TopK SAE (Gao et al. 2024, the non-hierarchical baseline). For the
+          hierarchical-pair-discovery experiment (Section 5.2), an additional axis of comparison is
+          "MCS" (post-hoc activation-coverage-based pair detection, applied to any SAE's independent
+          features) vs. "Tree Structure" (this paper's built-in allocation vectors, only applicable
+          to Tree SAE itself).
+        metrics: |
+          (a) Feature Absorption and Splitting rate (first-letter classification probing setup of
+          Chanin et al. 2024); (b) Feature Composition rate (average max cosine similarity between
+          feature decoder directions); (c) AutoInterp interpretability score (Bills et al. 2023;
+          Paulo et al. 2024 procedure, 200 sampled features); (d) the paper's novel "Hierarchy
+          metric" / hierarchical-pair-error-rate (Section 5.2): fraction of sampled parent-child
+          pairs where BOTH features are simultaneously in the top-5 highest-correlation features
+          with the child's true (linear-probe) concept direction; (e) downstream reconstruction
+          quality: cross-entropy loss when substituting reconstructed activations, and variance
+          explained, both averaged over 128K tokens; (f) child-feature diversity: average
+          co-activation rate among children sharing the same parent (lower = more diverse/less
+          redundant); (g) dead-feature rate over training (ablation of dynamic allocation, Fig. 14).
+
+      5_results:
+        main_findings: |
+          Tree SAE discovers substantially more hierarchical pairs than all other SAEs, under BOTH
+          MCS and its own built-in Tree Structure detection, with Tree Structure slightly more
+          accurate than MCS even for Tree SAE itself (Figure 4). Tree SAE remains competitive with
+          SOTA Matryoshka SAE on Feature Splitting, Absorption, Composition, and AutoInterp across
+          all sparsity levels and both 2-layer/4-layer configurations (Figure 3), while
+          significantly outperforming MP-SAE on splitting/absorption. Tree SAE achieves
+          substantially better reconstruction quality (cross-entropy, variance explained) than both
+          Matryoshka and TopK SAE, though MP-SAE has the best raw reconstruction quality overall
+          (Figure 6). Scaling experiments (6k/49k dictionary) show Tree SAE outperforms Matryoshka
+          at small dictionary sizes on Splitting/Absorption/Composition and matches it at larger
+          sizes (Figures 5, 7, 8). Child-feature co-activation/diversity is low (<3%, Table 3),
+          confirming children of the same parent represent genuinely distinct sub-concepts.
+          Dynamic allocation (Algorithm 2) is shown to nearly eliminate dead features by 40k steps
+          on a hard (4-layer, L0=32) configuration, vs. persistent dead-feature rates without it
+          (Figure 14). Appendix H proves (Propositions 1-2) that the combination of the recursive
+          activation-coverage gate (Eq. 6) and multi-level reconstruction loss (Eq. 7) provably
+          drives high reconstruction score S_res at convergence, while a naive single-level SAE
+          loss can converge to degenerate solutions where the parent doesn't reconstruct the child
+          concept at all (S_p=0, S_c=1).
+        tables_figures: |
+          Table 1 (per-layer average L0 for Matryoshka vs. Tree SAE, main experiment) and Table 2
+          (same, scaling experiment) -- needed to set exact per-layer sparsity targets for
+          reproduction. Table 3 (child co-activation rate, 2-layer and 4-layer Tree SAE across all
+          4 L0 levels: 0.010-0.028) -- a direct reproduction target for the "diversity" metric.
+          Table 4 (|d_p^T d_c| ~ 0.044-0.060, small) -- supports the near-orthogonality claim used
+          in the Appendix H proofs. Figure 3 (Splitting/Absorption/AutoInterp/Composition across
+          SAEs and L0) and Figure 4 (Hierarchy metric across SAEs and L0, MCS vs. Tree Structure)
+          are the primary quantitative reproduction targets for the paper's central claims. Figure
+          14 (dead-feature rate with/without dynamic allocation) is the key reproduction target for
+          validating Algorithm 2's practical necessity.
+
+  method_architecture:
+    method_name: "Tree SAE"
+
+    core_components:
+      component_1:
+        name: "Flat multi-block TopK SAE"
+        purpose: "The single learned encoder/decoder (Eq. 1-2) whose dictionary is partitioned into contiguous per-privilege-layer blocks; the only gradient-trained component."
+        paper_section: "Section 2.1, Section 4 intro"
+
+      component_2:
+        name: "Allocation vectors / tree state {a_l}"
+        purpose: "Non-parametric per-layer arrays mapping each feature to a parent feature index among ALL features at strictly earlier privilege layers (or the imaginary root); defines the tree/forest structure that Eq. 6's gate and the evaluation suite operate on."
+        paper_section: "Section 4 ('Tree Structure')"
+
+      component_3:
+        name: "Recursive activation-coverage gate"
+        purpose: "Computes the final, hierarchy-consistent feature activations f*(x) from raw TopK activations f(x), by recursively zeroing out any feature whose assigned parent's regularized activation is off -- architecturally guarantees S_cov=1 for every declared parent-child pair."
+        paper_section: "Section 4, Eq. 6"
+
+      component_4:
+        name: "Multi-level reconstruction + per-layer auxiliary loss"
+        purpose: "Trains the shared encoder/decoder so that EVERY prefix of privilege layers (1..l for all l) is independently a good reconstruction of the input, which (per Appendix H's proof) drives high reconstruction-condition alignment between parents and children as a byproduct, without needing an explicit pairwise constraint loss."
+        paper_section: "Section 4, Eq. 7-9"
+
+      component_5:
+        name: "Greedy allocation algorithm (Algorithm 1)"
+        purpose: "Given a capacity estimate per candidate parent and a fixed number of children to place at a layer, computes the max-min-fair optimal number of children per parent in O(s_l log m_l) via a max-heap, per Theorem 4.1."
+        paper_section: "Appendix G"
+
+      component_6:
+        name: "Dynamic feature reallocation (Algorithm 2)"
+        purpose: "Periodically recomputes optimal per-parent child counts (via Algorithm 1) and reassigns only DEAD children to under-served parents via first-fit, combating the dead-feature problem the rigid tree structure otherwise causes; plus a one-time 'dead features to root' rule at ~50% of training."
+        paper_section: "Appendix G, Section 4 prose"
+
+      component_7:
+        name: "Hierarchy-consistency evaluation suite"
+        purpose: "Computes the paper's novel hierarchical-pair metric (linear-probe-based top-5 co-membership rate), the reconstruction score S_res (Eq. 5, using trained linear probes as ground-truth concept directions), the MCS baseline (best variant: non-scaling binary correlation), and standard SAE-pathology metrics (absorption, splitting, composition, AutoInterp)."
+        paper_section: "Section 2.2 (S_res examples), Section 5.1-5.3, Appendix D, Appendix I"
+
+    component_interactions:
+      - "Component 1's raw activations feed into Component 3's recursive gate, which consumes Component 2's current allocation to decide what gets zeroed; the gate must run layer-by-layer since each layer depends on the already-gated output of all earlier layers."
+      - "Component 3's gated activations feed Component 4's multi-level reconstruction and per-layer auxiliary losses, whose gradients update Component 1's encoder/decoder."
+      - "Component 1's per-batch reconstruction loss (per active parent feature) is accumulated into a running capacity estimate C_p, consumed by Component 5 (via Component 6) to recompute optimal allocation."
+      - "Component 6 orchestrates Component 5 (the allocation solver) plus a first-fit dead-feature reassignment step, writing back into Component 2's allocation vectors; it runs on a periodic schedule interleaved with Component 1/3/4's per-step training loop."
+      - "Component 7 is an offline/evaluation-time consumer of a trained Tree SAE (Components 1-2), and additionally runs on independently trained Matryoshka/MP-SAE/TopK baselines using the MCS procedure instead of Component 2's allocation, for comparison."
+
+    theoretical_foundation:
+      key_insight: |
+        The prior-work criterion for a hierarchical pair -- "activation coverage" (child rarely
+        fires without its parent) -- is only a NECESSARY condition, not a sufficient one: a densely
+        or spuriously active but semantically empty parent feature can trivially "cover" many
+        unrelated children. A genuinely faithful hierarchy additionally requires a RECONSTRUCTION
+        condition: both parent and child decoder vectors must meaningfully contribute to
+        reconstructing the child's true underlying concept direction. Rather than trying to
+        optimize this reconstruction condition directly as an auxiliary pairwise loss (which the
+        companion paper on HSAE does via an explicit L_PC term), this paper shows it emerges
+        naturally, PROVABLY (Appendix H), from combining architectural activation-coverage gating
+        (Eq. 6) with a multi-level cumulative reconstruction objective (Eq. 7): forcing every
+        prefix of layers to reconstruct well means each layer must add genuinely new, aligned
+        information rather than an arbitrary orthogonal direction.
+      why_it_works: |
+        Appendix H's Proposition 1 shows that optimizing the multi-level loss L1 = L_recons
+        (restricted to a parent-child pair under Eq. 6's strict coverage) either drives both
+        parent and child decoder vectors toward the true concept direction (high S_res) or
+        degenerates to the parent alone fully explaining the child concept (S_p=1, S_c=0) --
+        crucially, it PROVABLY CANNOT degenerate to the failure mode of a standard single-level SAE
+        loss L2, which can converge with S_c=1, S_p=0 (child explains everything, parent
+        contributes nothing -- i.e. an "activation-coverage-satisfying but semantically empty"
+        parent, exactly the failure mode motivating this paper). The dynamic allocation mechanism
+        (Algorithms 1-2) is a separate, complementary piece of engineering needed because the
+        architectural rigidity of Eq. 6's tree (fixed parent-child slots) otherwise starves poorly
+        allocated parents' children of gradient signal, causing dead features.
+
+  implementation_requirements:
+    algorithms_to_implement:
+      - algorithm: "Tree SAE forward pass with recursive activation-coverage gating (Eq. 1, 6)"
+        section: "Section 2.1, Section 4"
+        complexity: "Medium"
+        dependencies: ["flat TopK SAE encoder", "current allocation vectors {a_l}"]
+
+      - algorithm: "Multi-level reconstruction + per-layer auxiliary loss (Eq. 2, 7-9)"
+        section: "Section 4"
+        complexity: "Medium"
+        dependencies: ["gated activations f*(x)", "per-layer decoder blocks", "per-layer dead-feature masks"]
+
+      - algorithm: "Algorithm 1: Greedy allocation algorithm"
+        section: "Appendix G"
+        complexity: "Medium"
+        dependencies: ["per-parent capacity estimates C_p", "parent eligibility mask"]
+
+      - algorithm: "Algorithm 2: Full dynamical feature reallocation algorithm"
+        section: "Appendix G"
+        complexity: "Complex"
+        dependencies: ["Algorithm 1", "per-layer dead-feature pool", "current allocation vectors {a_l}"]
+
+    models_to_build:
+      - model: "TreeSAE (flat multi-block TopK SAE + allocation state)"
+        architecture_location: "Section 2.1 (base SAE), Section 4 (tree structure)"
+        purpose: "The complete model: encode -> gate -> per-layer decode -> multi-level loss, plus the allocation state consumed by the gate and updated by Algorithm 2."
+
+    data_processing:
+      - pipeline: "Activation collection from GPT2-small layer 5"
+        requirements: "Run GPT2-small forward over The Pile text, extract residual-stream activations at layer 5, collect until 500M tokens' worth of activations are available for training."
+
+      - pipeline: "Linear probe training for ground-truth concept directions d*_c"
+        requirements: "For each feature of interest, train a linear probe (logistic/linear classifier) to separate that feature's activating token examples from all others; the resulting weight vector is used as d*_c for computing S_res (Eq. 5) and the Section 5.2 hierarchical-pair metric."
+
+    evaluation_suite:
+      - metric: "Reconstruction score S_res(fp, fc)"
+        formula_location: "Eq. 5, Section 3"
+        purpose: "Measures whether both parent and child decoder vectors meaningfully align with the child's true concept direction -- the paper's core novel hierarchy-validity metric."
+
+      - metric: "Hierarchical-pair metric (Section 5.2)"
+        formula_location: "Section 5.2 (procedure description, no single closed-form equation)"
+        purpose: "Fraction of sampled parent-child pairs where BOTH features rank in the top-5 highest-correlation features with the child's true (probe) direction; the paper's primary quantitative benchmark for comparing hierarchy-discovery quality across SAEs and procedures (Tree Structure vs. MCS)."
+
+      - metric: "Activation coverage S_cov(fp, fc)"
+        formula_location: "Eq. 4, Section 2.1"
+        purpose: "The (insufficient-alone, but still necessary and used as a pre-filter/baseline criterion) prior-work hierarchy metric; needed to implement the MCS baseline comparison."
+
+      - metric: "Feature Absorption / Splitting / Composition / AutoInterp"
+        formula_location: "Section 5.1, Appendix D.1, D.3 (following Chanin et al. 2024 and Bills et al./Paulo et al. procedures)"
+        purpose: "Standard SAE-pathology and interpretability benchmarks used to confirm Tree SAE does not sacrifice standard SAE quality."
+
+      - metric: "Downstream reconstruction (cross-entropy, variance explained) and child-feature diversity (co-activation rate)"
+        formula_location: "Appendix D.2; Section 6.3 / Table 3"
+        purpose: "Standard reconstruction-fidelity check, plus a Tree-SAE-specific sanity check that children of the same parent are not redundant."
+
+  reproduction_roadmap:
+    phase_1: |
+      Implement the flat multi-block TopK SAE, the allocation-vector state (with a trivial/random
+      initial assignment), and the recursive activation-coverage gate (Eq. 6); validate on a small
+      synthetic activation dataset that the gate produces a valid tree (every non-root-parented
+      feature is zero whenever its parent is zero) and that encode/decode shapes are correct.
+    phase_2: |
+      Implement the multi-level reconstruction loss and per-layer auxiliary loss (Eq. 7-9), and a
+      basic training loop (no dynamic reallocation yet -- fixed random allocation); validate that
+      training reduces reconstruction loss and that later layers' cumulative reconstruction
+      dominates earlier layers' (sanity check on Eq. 7's intent).
+    phase_3: |
+      Implement Algorithm 1 (greedy allocation via max-heap) and Algorithm 2 (dynamic dead-feature
+      reallocation via first-fit), wire the reallocation schedule and the 50%-of-training
+      dead-to-root rule into the training loop; validate that dead-feature rate drops over training
+      when dynamic allocation is enabled, replicating the qualitative direction of Figure 14, at
+      small/synthetic scale.
+    phase_4: |
+      Implement the evaluation suite (activation coverage, reconstruction score via linear probes,
+      the Section 5.2 hierarchical-pair metric, and the MCS non-scaling-binary baseline); compare
+      Tree Structure vs. MCS detection quality on the same trained model as a correctness check,
+      expecting Tree Structure to be at least comparable to (and, per the paper, slightly better
+      than) MCS.
+
+  validation_checklist:
+    - "[ ] The recursive activation-coverage gate (Eq. 6) never activates a non-root-parented feature when its parent's regularized activation is zero, verified on a synthetic batch (S_cov=1 by construction for every declared pair)."
+    - "[ ] Tree SAE trains without diverging on a small-scale run and its multi-level reconstruction loss decreases."
+    - "[ ] Algorithm 1 returns an allocation achieving the theoretical max-min payoff for a hand-constructed small capacity set (verifiable against Theorem 4.1's closed form: tau* = the s_l-th largest element of {C_p/k})."
+    - "[ ] Algorithm 2 only ever reassigns features currently marked dead; already-alive children are unchanged across a reallocation call."
+    - "[ ] Dead-feature rate decreases over a small-scale training run when dynamic allocation is enabled, relative to an otherwise-identical run with allocation frozen at its (poor) random initialization, replicating the qualitative direction of Figure 14."
+    - "[ ] On synthetic data with a known ground-truth hierarchy, the hierarchical-pair metric (Section 5.2, using known-good linear separators as a synthetic 'probe') scores Tree SAE's built-in Tree Structure detection at least as well as the MCS baseline applied to the same trained features."

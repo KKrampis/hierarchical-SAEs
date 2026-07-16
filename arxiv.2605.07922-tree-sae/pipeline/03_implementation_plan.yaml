@@ -1,0 +1,280 @@
+complete_reproduction_plan:
+  paper_info:
+    title: "Tree SAE: Learning Hierarchical Feature Structures in Sparse Autoencoders"
+    core_contribution: "A tree-structured SAE that architecturally enforces activation coverage via a recursive per-layer gate (Eq. 6) and drives the stronger 'reconstruction condition' as a provable byproduct of a multi-level cumulative reconstruction loss (Eq. 7-9), combined with a dynamic, capacity-aware feature-reallocation mechanism (Algorithms 1-2) that combats the dead-feature problem the rigid tree structure otherwise causes."
+
+  # ============================================
+  # Section 1: File Structure
+  # ============================================
+  file_structure: |
+    arxiv.2605.07922-tree-sae/
+    ├── pipeline/                        # paper2code intermediate artifacts (this file's siblings)
+    │   ├── 01_algorithm_extraction.yaml
+    │   ├── 02_concept_analysis.yaml
+    │   └── 03_implementation_plan.yaml
+    ├── src/
+    │   └── tree_sae/
+    │       ├── __init__.py
+    │       ├── config.py               # all hyperparameters/dataclasses
+    │       ├── models/
+    │       │   ├── __init__.py
+    │       │   └── tree_sae.py         # flat multi-block TopK SAE + allocation state + Eq.6 gate
+    │       ├── algorithms/
+    │       │   ├── __init__.py
+    │       │   └── allocation.py       # Algorithm 1 (greedy) + Algorithm 2 (dynamic reallocation)
+    │       ├── training/
+    │       │   ├── __init__.py
+    │       │   ├── losses.py           # L_recons, L_aux, L_tree (Eq. 7-9)
+    │       │   └── trainer.py          # training loop incl. reallocation schedule
+    │       ├── data/
+    │       │   ├── __init__.py
+    │       │   └── activations.py      # synthetic dataset + real-model collector
+    │       ├── evaluation/
+    │       │   ├── __init__.py
+    │       │   ├── coverage.py         # S_cov (Eq.4) + MCS baseline (non-scaling binary, Appendix I)
+    │       │   ├── reconstruction_score.py  # S_res (Eq.5) via linear probes
+    │       │   └── hierarchy_metric.py # Section 5.2 top-5 co-membership metric
+    │       └── utils/
+    │           ├── __init__.py
+    │           └── seed.py
+    ├── experiments/
+    │   ├── run_train.py                # train a Tree SAE end-to-end
+    │   ├── run_eval.py                 # compute hierarchy-consistency + reconstruction metrics
+    │   └── run_ablation.py             # dynamic-allocation on/off dead-feature-rate comparison (Figure 14)
+    ├── tests/
+    │   └── test_smoke.py               # fast CPU smoke test on synthetic data
+    ├── main.py                         # CLI entry point (train / eval / ablate)
+    ├── pyproject.toml                  # uv project config + dependencies
+    └── README.md                       # usage documentation
+
+  # ============================================
+  # Section 2: Implementation Components
+  # ============================================
+  implementation_components: |
+    ## 1. Core Model
+
+    ### 1.1 TreeSAE (flat multi-block TopK SAE + allocation + gate)
+    - Location: src/tree_sae/models/tree_sae.py
+    - Purpose: single encoder/decoder over the full flat dictionary (Eq. 1-2), partitioned into
+      contiguous per-privilege-layer blocks; owns the allocation vectors {a_l} (parent index per
+      feature, values index into the concatenation of all STRICTLY EARLIER layers, or -1/root);
+      implements the recursive activation-coverage gate (Eq. 6).
+    - Pseudocode (from pipeline/01_algorithm_extraction.yaml):
+      ```
+      raw = TopK(x @ W_enc + b_enc, k=L0)          # shape [B, d_f], flat over all layers
+      f_star = zeros_like(raw)
+      f_star[layer 1 block] = raw[layer 1 block]    # layer-1 parents are always the root -> ungated
+      for l in 2..L:
+          parent_active = gather(f_star[layers 0..l-1 concatenated], a_l) > 0
+          f_star[layer l block] = raw[layer l block] * parent_active
+      x_hat_cumulative[l] = sum_{t=1}^l (f_star[layer t block] @ W_dec_block[t]) + b_dec
+      ```
+    - Key equations: Eq. 1 (encode), Eq. 2 (decode), Eq. 6 (recursive gate).
+    - Hyperparameters: d_f = sum(layer_sizes); layer_sizes e.g. [6144,18432] (2-layer) or
+      [1536,3072,9216,10752] (4-layer) at dictionary size 24576 (source: Appendix C, Table 1).
+    - Implementation notes: TopK activation applied ONCE over the flat raw pre-activation (not
+      per-block); the gate is applied AFTER TopK selection, so gating can only zero out already
+      raw-selected features (never un-select something TopK excluded, and never add a feature TopK
+      excluded). Because layer sizes are fixed at construction time but block boundaries never
+      change, block indices can be precomputed once.
+
+    ## 2. Losses
+
+    ### 2.1 Multi-level reconstruction + per-layer auxiliary loss
+    - Location: src/tree_sae/training/losses.py
+    - Formulas (Eq. 7-9):
+      L_recons(x) = sum_l || cumulative_recon[l] - x ||_2^2
+      L_aux,l(x) = || e_hat_l + cumulative_recon[l] - x ||_2^2   (e_hat_l from layer-l's top-256 dead features)
+      L_tree(x) = L_recons(x) + sum_l alpha_l * L_aux,l(x)
+    - Hyperparameters: aux_topk=256, alpha_1=1/32, alpha_{2..L}=0 in main config (source: Appendix C).
+    - Implementation notes: e_hat_l is computed from RAW (ungated) pre-activations of layer-l's
+      currently-dead features (a boolean per-feature "dead" mask maintained by the trainer, based
+      on steps/tokens since last nonzero raw activation), matching Gao et al. (2024) convention.
+
+    ## 3. Allocation Algorithms
+
+    ### 3.1 Algorithm 1: Greedy allocation
+    - Location: src/tree_sae/algorithms/allocation.py
+    - Formula: k*_l = argmax_k min_{p|k_p>0}(C_p/k_p) s.t. sum k_p = s_l (Eq. 10, Theorem 4.1).
+    - Implementation notes: implement with Python's heapq as a max-heap (negate payoff values);
+      exclude ineligible parents (activation rate < 1/50,000 tokens) from the heap up front;
+      O(s_l log m_l).
+
+    ### 3.2 Algorithm 2: Dynamic feature reallocation
+    - Location: src/tree_sae/algorithms/allocation.py (same module)
+    - Purpose: per layer, call Algorithm 1 for the target counts, then first-fit-reassign only
+      DEAD children to under-served parents; leaves alive children untouched.
+    - Hyperparameters: reallocation schedule (3000 initial, +2000/event [INFERRED unit], cap 10000),
+      dead-feature window 10M tokens (source: Appendix G).
+    - Implementation notes: capacity C_p accumulated as running sum of per-instance batch loss for
+      every batch instance on which parent p is (raw-)active, reset after each reallocation call.
+
+    ## 4. Training
+
+    ### 4.1 Trainer
+    - Location: src/tree_sae/training/trainer.py
+    - Steps: per step -> sample batch -> forward (encode+gate+decode, Eq. 1/2/6) -> compute L_tree
+      (2.1) -> backward -> Adam step -> gradient-norm clip + decoder renorm -> update dead-feature
+      tracker + capacity accumulators -> on schedule, run Algorithm 2 (3.2) -> at ~50% of training,
+      reassign all still-dead features to the root.
+    - Hyperparameters: batch_size=5120, lr=1e-4, Adam (source: Appendix C).
+
+    ## 5. Data
+
+    ### 5.1 Activation Dataset
+    - Location: src/tree_sae/data/activations.py
+    - Purpose: (a) real path -- collect GPT2-small layer-5 residual-stream activations over The
+      Pile (decoupled interface, requires user-supplied model/tokenizer/corpus); (b) synthetic path
+      (default here) -- `SyntheticHierarchicalActivations` reusing the same generator design as the
+      companion HSAE repo (arxiv.2602.11881-atoms-to-trees-hsae/src/hsae/data/activations.py), with
+      a known ground-truth MULTI-LEVEL tree (not just adjacent-level) matching Tree SAE's
+      "parent-at-any-earlier-layer" structure, so training + evaluation can be smoke-tested on CPU.
+
+    ## 6. Evaluation
+
+    ### 6.1 Activation Coverage + MCS baseline
+    - Location: src/tree_sae/evaluation/coverage.py
+    - Metric: S_cov (Eq. 4); MCS best variant = non-scaling, binary-activation correlation
+      (Appendix I) used as the baseline post-hoc hierarchy-detection procedure for comparison
+      against Tree SAE's built-in Tree Structure.
+
+    ### 6.2 Reconstruction Score
+    - Location: src/tree_sae/evaluation/reconstruction_score.py
+    - Metric: S_res (Eq. 5), requires a per-feature linear probe as ground-truth concept direction
+      d*_c; provide a `train_linear_probe(activating_mask, activations) -> direction` helper.
+
+    ### 6.3 Hierarchical-Pair Metric
+    - Location: src/tree_sae/evaluation/hierarchy_metric.py
+    - Metric: Section 5.2's top-5 co-membership rate, using linear-probe directions as ground
+      truth; supports both the Tree SAE's built-in Tree Structure and the MCS baseline as the
+      pair-detection procedure being evaluated.
+
+  # ============================================
+  # Section 3: Validation Approach
+  # ============================================
+  validation_approach: |
+    ## 1. Unit Tests
+    - [ ] TreeSAE.forward produces the correct flat/per-block shapes, and the gate never leaves a
+          non-root-parented feature active when its parent's *regularized* activation is zero.
+    - [ ] Algorithm 1 returns an allocation whose achieved min-payoff matches the closed-form
+          Theorem-4.1 value (s_l-th largest element of {C_p/k}) on a hand-constructed capacity set.
+    - [ ] Algorithm 2 never reassigns an already-alive feature; only dead features move.
+    - [ ] L_recons and L_aux,l compute the expected values on a hand-constructed 2-layer example
+          with known feature outputs.
+
+    ## 2. Integration Tests
+    - [ ] Full TreeSAE (small L=2 or 3, small layer sizes) trains for a few hundred steps on
+          `SyntheticHierarchicalActivations` without NaNs/Infs and with decreasing L_recons.
+    - [ ] Dead-feature rate, tracked over a short training run, decreases when dynamic allocation
+          (Algorithm 2) is enabled relative to an otherwise-identical run with allocation frozen at
+          its initial (poor, random) assignment -- a small/CPU-scale reproduction of Figure 14's
+          qualitative direction (see run_ablation.py caveats about run-to-run noise at tiny scale,
+          matching the precedent set in the companion HSAE repo's ablation script).
+
+    ## 3. Paper Result Reproduction (scaled down; full scale needs GPT2-small + 500M Pile tokens)
+    - Run: `uv run python experiments/run_train.py --steps 300` (synthetic, CPU, seconds).
+    - Run: `uv run python experiments/run_eval.py --steps 300` to compute S_cov, S_res, and the
+      hierarchical-pair metric for the trained model's built-in Tree Structure vs. an MCS baseline
+      applied to the same features, expecting Tree Structure to be at least comparable.
+    - Run: `uv run python experiments/run_ablation.py --steps 300` to compare dead-feature rate
+      with vs. without dynamic allocation.
+    - The paper's full-scale numeric targets (Table 1-4, Figure 3-8, 14) are recorded in
+      pipeline/01_algorithm_extraction.yaml / 02_concept_analysis.yaml for anyone running the full
+      GPT2-small + Pile configuration on suitable hardware.
+
+    ## 4. Success Criteria
+    - [ ] `tests/test_smoke.py` passes on CPU in well under a minute.
+    - [ ] Dynamic allocation measurably reduces the synthetic-scale dead-feature rate relative to
+          frozen-random allocation.
+    - [ ] Tree Structure's hierarchical-pair-metric score is not worse than the MCS baseline's on
+          the same synthetic trained model (mirrors the paper's qualitative claim that its built-in
+          structure detection is at least as good as, and typically better than, MCS).
+
+  # ============================================
+  # Section 4: Environment Setup
+  # ============================================
+  environment_setup: |
+    ## Python Version
+    - Python 3.10+ (uv recommended)
+
+    ## Package Management (using uv)
+    ```bash
+    uv init --no-readme --name tree-sae
+    uv add torch numpy scikit-learn pyyaml tqdm
+    uv add --optional real-models transformers transformer-lens datasets
+    uv run python main.py --help
+    ```
+
+    ## Core Dependencies
+    ```
+    torch>=2.1.0
+    numpy>=1.24.0
+    scikit-learn>=1.3.0     # LogisticRegression for linear-probe ground-truth directions
+    pyyaml>=6.0
+    tqdm>=4.66.0
+    ```
+
+    ## Optional Dependencies
+    ```
+    transformers, transformer-lens, datasets   # only needed for real GPT2-small + The Pile activation collection
+    ```
+
+    ## Hardware Requirements
+    - Smoke tests / synthetic-data validation: any CPU, seconds to a couple of minutes.
+    - Full-scale reproduction (GPT2-small, dict size up to 49152, 500M Pile tokens, batch 5120):
+      a single modern GPU is sufficient (GPT2-small is far smaller than the companion HSAE paper's
+      gemma2-2b), but downloading The Pile and running ~97,656 training steps is still out of scope
+      for this development environment; the codebase supports it but it is not executed here.
+
+    ## Dataset Preparation
+    - Synthetic path (default, used for tests/validation here): generated in-memory, no download.
+    - Real path (optional, user-supplied): The Pile (Gao et al., 2020) text + GPT2-small
+      (HuggingFace `gpt2`) to extract layer-5 residual-stream activations from.
+
+  # ============================================
+  # Section 5: Implementation Strategy
+  # ============================================
+  implementation_strategy: |
+    ## Phase 1: Foundation (first)
+    1. pyproject.toml + src/tree_sae/config.py — hyperparameters as dataclasses with paper defaults.
+    2. src/tree_sae/utils/seed.py — seeding helper (reused pattern from the companion HSAE repo).
+
+    Validation: config loads and instantiates with defaults.
+
+    ## Phase 2: Core Model & Losses
+    3. src/tree_sae/models/tree_sae.py — flat multi-block TopK SAE, allocation state, Eq. 6 gate.
+    4. src/tree_sae/training/losses.py — L_recons, L_aux,l, L_tree.
+
+    Validation: unit tests for gate correctness and loss values on hand-constructed examples.
+
+    ## Phase 3: Allocation Algorithms & Training Pipeline
+    5. src/tree_sae/algorithms/allocation.py — Algorithm 1 (greedy) + Algorithm 2 (reallocation).
+    6. src/tree_sae/data/activations.py — synthetic multi-level-tree generator + real collector stub.
+    7. src/tree_sae/training/trainer.py — training loop with reallocation schedule + dead-to-root rule.
+
+    Validation: overfitting test on synthetic data; dead-feature-rate-decreases-with-allocation test.
+
+    ## Phase 4: Evaluation & Experiments
+    8. src/tree_sae/evaluation/coverage.py — S_cov + MCS (non-scaling binary) baseline.
+    9. src/tree_sae/evaluation/reconstruction_score.py — S_res via linear probes.
+    10. src/tree_sae/evaluation/hierarchy_metric.py — Section 5.2 top-5 co-membership metric.
+    11. experiments/run_train.py, experiments/run_eval.py, experiments/run_ablation.py.
+    12. main.py — CLI entry point.
+    13. tests/test_smoke.py — end-to-end CPU smoke test.
+
+    Validation: Tree-Structure-vs-MCS comparison on synthetic data; smoke test passes.
+
+    ## Phase 5: Documentation (last)
+    14. README.md — usage instructions, scope/limitations note (no full-scale GPT2-small/Pile run
+        performed in this environment), pointers to pipeline/01_algorithm_extraction.yaml's targets.
+
+    ## Handling Missing Details
+    - Exact TopK k per configuration: use L0 directly as k (paper states L0 IS the TopK level).
+    - Reallocation interval growth unit ("+2"): implement as +2000 steps/event (documented INFERRED
+      default), exposed as a config constant.
+    - Capacity accumulation window T: implement as T = current reallocation interval (documented
+      INFERRED default).
+    - Gradient-normalization scheme: implement as global gradient-norm clipping to 1.0 (documented
+      INFERRED default), exposed as a config constant.
+    - Initial allocation rule: implement as uniform-random assignment among eligible earlier-layer
+      features at construction time (documented INFERRED default).

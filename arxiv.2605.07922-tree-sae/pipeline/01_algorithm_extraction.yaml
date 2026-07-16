@@ -1,0 +1,371 @@
+complete_algorithm_extraction:
+  paper_structure:
+    method_sections: ["2.1", "2.2", "3", "4", "Appendix C", "Appendix G", "Appendix H"]
+    algorithm_count: 4  # (1) Tree SAE architecture/forward pass with recursive activation-coverage gating,
+                         # (2) multi-level reconstruction + per-layer auxiliary training loss,
+                         # (3) Algorithm 1: greedy optimal child-allocation algorithm,
+                         # (4) Algorithm 2: full dynamic dead-feature reallocation algorithm
+
+  main_algorithm:
+    algorithm_name: "Tree SAE: tree-structured sparse autoencoder with activation-coverage-gated hierarchical features"
+    section: "Section 4 ('Tree Sparse Autoencoder')"
+    algorithm_box: "No single end-to-end box; architecture in Section 4 prose + Eq. 6, training loss in Eq. 7-9, allocation in Algorithm 1 (line 897) and Algorithm 2 (line 940)."
+
+    pseudocode: |
+      # Reconstructed from Section 2.1 (base SAE), Section 4 (tree structure + losses),
+      # and Appendix G (Algorithm 1, Algorithm 2). The paper has no single unified
+      # end-to-end training-loop box; this composes the pieces it does give.
+      Input: activation dataset D (500M tokens of residual-stream activations from a target
+             LLM site), L privilege layers with feature counts s_1,...,s_L, batch size 5120,
+             learning rate 1e-4, aux top-k = 256, per-layer aux coefficients alpha_1..alpha_L,
+             reallocation schedule (initial interval 3000 steps, +2000 per reallocation,
+             capped at 10000 steps), dead-feature window = 10,000,000 tokens,
+             parent-eligibility rate = 1 activation per 50,000 tokens
+      Output: trained encoder/decoder {We, Wd, b} and allocation vectors {a_l} for l=1..L
+              (a_l[i] = index, among all features at layers 0..l-1, of feature i's parent;
+              layer 0 is an imaginary root node with a single "feature", s_0 = 1)
+
+      1. Initialize a single flat SAE encoder/decoder (We in R^{df x dm}, Wd in R^{dm x df},
+         b in R^{dm}) where df = sum_l s_l is the total dictionary size, partitioned into
+         contiguous blocks of size s_1, ..., s_L (one block per privilege layer).
+      2. Initialize allocation vectors {a_l}: for l=1, parents are drawn from the single
+         root node (layer 0); for l>1, initialize parents arbitrarily among all features in
+         layers 0..l-1 (paper does not specify the exact initial-assignment rule -- see
+         missing_but_critical).
+      3. For each training step:
+         3.1 Sample a batch x ~ D (batch size 5120).
+         3.2 Compute raw per-feature activations f(x) = sigma(We(x - b)) (Eq. 1), sigma =
+             TopK-style activation (paper uses "the same Top-k activation function ... to be
+             consistent with Top-k SAE", Appendix C).
+         3.3 Compute the activation-coverage-regularized activations f*(x) recursively from
+             root to leaves (Eq. 6): a layer-0-parented feature keeps its raw activation;
+             every other feature i is gated to f_i(x) * 1(f*_{a_{l,i}}(x) > 0), i.e. it can
+             only be "on" if its assigned parent's *regularized* activation is itself on.
+             This must be computed layer-by-layer in increasing l (since layer l depends on
+             the already-regularized f* of layers < l), enforcing the activation coverage
+             condition (Scov = 1) by construction rather than as a soft penalty.
+         3.4 For each layer l = 1..L, compute the partial reconstruction contribution
+             x_hat_t = Wd_block[t] f*_block[t](x) + b for t=1..l (features restricted to
+             privilege layer t), and the cumulative reconstruction sum_{t=1}^l x_hat_t.
+         3.5 Compute the multi-level reconstruction loss L_recons(x) = sum_{l=1}^L
+             || sum_{t=1}^l x_hat_t - x ||_2^2 (Eq. 7).
+         3.6 For each layer l, compute the per-layer auxiliary loss L_aux,l(x) = || e_hat_l +
+             sum_{t=1}^l x_hat_t - x ||_2^2 (Eq. 8), where e_hat_l is the reconstruction of the
+             *current residual error* using the top-256 dead features (across the whole
+             dictionary, standard Gao et al. 2024 aux-loss convention) restricted/attributed to
+             layer l's dead-feature reconstruction pathway.
+         3.7 Compute total loss L_tree(x) = L_recons(x) + sum_{l=1}^L alpha_l * L_aux,l(x)
+             (Eq. 9), with alpha_1 = 1/32 and alpha_2..alpha_L = 0 in the main experiment
+             (only the first privilege layer gets an auxiliary loss), or alpha_l = 1/128 for
+             all l in the alternative configuration mentioned for other models.
+         3.8 Backpropagate and update {We, Wd, b} with Adam (lr = 1e-4); normalize the
+             gradient and renormalize the decoder vectors at each backward step.
+         3.9 Update each parent feature's running "capacity" accumulator: for every instance
+             in the batch on which a parent feature p is active, add that instance's batch
+             loss contribution to p's running capacity sum C_p (accumulated over the next T
+             steps until the next reallocation event).
+         3.10 Every `reallocation_interval` steps (see schedule below), run the Dynamic
+              Feature Reallocation procedure (Algorithm 2) to update {a_l}, then reset the
+              capacity accumulators and increase the interval by 2000 steps (capped at 10000).
+         3.11 At approximately half of total training (~50,000 steps in the paper's setup),
+              move all currently-dead features to be direct children of the root node
+              (layer 0), overriding their previous allocation, so they can activate freely.
+      4. Return the trained SAE and final allocation vectors {a_l}.
+
+    mathematical_formulation:
+      - equation: "f(x) = sigma(We (x - b))"
+        equation_number: "Eq. 1, Section 2.1"
+        where:
+          x: "hidden latent activation in R^{d_m} from the target LLM"
+          We: "encoder weight matrix in R^{d_f x d_m}"
+          b: "autoencoder bias in R^{d_m}"
+          sigma: "non-linear sparse activation function enforcing f_i(x) >= 0 for all i (paper uses TopK activation, Appendix C, 'the same Top-k activation function ... for Tree SAE and Matryoshka to be consistent with Top-k SAE')"
+          d_f: "total (overcomplete) dictionary size, i.e. sum of all privilege-layer feature counts"
+
+      - equation: "x_hat = Wd f(x) + b"
+        equation_number: "Eq. 2, Section 2.1"
+        where:
+          Wd: "decoder weight matrix in R^{d_m x d_f}"
+          x_hat: "reconstruction of the original latent x"
+
+      - equation: "L(x) = ||x_hat - x||_2^2 + alpha * L_aux(x)"
+        equation_number: "Eq. 3, Section 2.1 (base/standard SAE loss, before the Tree-specific multi-level version)"
+        where:
+          L_aux: "auxiliary loss (Gao et al., 2024) that reduces dead features"
+          alpha: "scaling coefficient for the auxiliary loss"
+
+      - equation: "S_cov(fp, fc) = [sum_x 1(fp(x)>0 AND fc(x)>0)] / [sum_x 1(fc(x)>0)]"
+        equation_number: "Eq. 4, Section 2.1 ('Activation coverage for hierarchical feature pair')"
+        where:
+          fp: "candidate parent feature"
+          fc: "candidate child feature"
+          1(.): "indicator function"
+          note: "a hierarchical relationship is inferred (under the prior-work MCS criterion) when S_cov > tau_cov, a predefined threshold; the paper shows this condition alone is insufficient (Section 2.2)"
+
+      - equation: "S_res(fp, fc) = min( (d*_c)^T d_c, (d*_c)^T d_p )"
+        equation_number: "Eq. 5, Section 3 ('Our Proposed Reconstruction Condition')"
+        where:
+          d_c: "decoder vector of the child feature fc"
+          d_p: "decoder vector of the parent feature fp"
+          d*_c: "the true/ground-truth concept direction associated with fc's concept, estimated in practice by training a linear probe to separate fc's activating examples from all others (Appendix H notes why the child's own encoder vector cannot be used as a stand-in for d*_c: Proposition 2 shows e_c^T d_p ~= 0 at convergence, so it cannot discriminate correct from incorrect pairs)"
+          note: "a valid hierarchical pair requires both S_res components to be reasonably high -- both parent and child decoder vectors must align with the child's true concept direction"
+
+      - equation: |
+          f*_i(x) = f_i(x)                              if a_{l,i} is in layer 0 (i.e. i's assigned parent is the root)
+          f*_i(x) = f_i(x) * 1(f*_{a_{l,i}}(x) > 0)      otherwise
+        equation_number: "Eq. 6, Section 4 ('Combining Activation Coverage with Tree Structure')"
+        where:
+          a_{l,i}: "the parent-feature index (from the allocation vector a_l) of the i-th feature at privilege layer l"
+          f*_i(x): "the final, activation-coverage-regularized activation of feature i, used everywhere downstream (reconstruction, loss, evaluation) in place of the raw f_i(x)"
+          note: "this is a RECURSIVE definition: f*_{a_{l,i}}(x) refers to the *already-regularized* activation of the parent, so f* must be computed layer-by-layer from the root outward (layer 1 first, since its parents are always the root; then layer 2, whose parents may be in layer 0 or 1; etc.) This construction enforces S_cov = 1 for every parent-child pair *by architecture* rather than as a soft training penalty."
+
+      - equation: "L_recons(x) = sum_{l=1}^{L} || sum_{t=1}^{l} x_hat_t - x ||_2^2"
+        equation_number: "Eq. 7, Section 4 ('Ensuring Reconstruction Condition via Training Loss')"
+        where:
+          x_hat_t: "reconstruction contribution of features restricted to privilege layer t only: x_hat_t = Wd_block[t] f*_block[t](x) (+ shared bias b, added once at the outermost sum in practice to avoid double-counting -- see implementation_details)"
+          note: "the *cumulative* sum sum_{t=1}^l x_hat_t must, for every l, be close to x -- this forces parent (lower-l) feature vectors to capture general-level concepts, with each subsequent layer's features refining the residual, which is exactly the mechanism the Appendix H proof (Proposition 1) shows drives high reconstruction score S_res."
+
+      - equation: "L_aux,l(x) = || e_hat_l + sum_{t=1}^{l} x_hat_t - x ||_2^2"
+        equation_number: "Eq. 8, Section 4"
+        where:
+          e_hat_l: "reconstruction of the residual error at privilege layer l, computed from the top-k dead features with the highest pre-activation value (standard Gao et al., 2024 aux-loss mechanism), applied per-privilege-layer rather than globally over all features (the paper's key modification: 'instead of applying the auxiliary loss over all of the features, we apply the auxiliary loss on each privilege layer, ensuring that the dead child feature reconstructs the error of their parents, obeying the reconstruction condition')"
+
+      - equation: "L_tree(x) = L_recons(x) + sum_{l=1}^{L} alpha_l * L_aux,l(x)"
+        equation_number: "Eq. 9, Section 4 (final Tree SAE training loss)"
+        where:
+          alpha_l: "per-layer auxiliary loss scaling coefficient; main experiment uses alpha_1 = 1/32, alpha_2 = alpha_3 = alpha_4 = 0 (aux loss only on the first/coarsest privilege layer); alternative alpha_l = 1/128 for all l noted as beneficial on other models (e.g. Gemma-2-2b), Appendix C"
+
+      - equation: "k*_l = argmax_{k_l} min_{p | k_{l,p} > 0} (C_p / k_{l,p}),  s.t. sum_p k_{l,p} = s_l"
+        equation_number: "Eq. 10, Section 4 ('Obtaining Optimal Feature Allocation')"
+        where:
+          C_p: "the 'capacity' of candidate parent feature p -- in the paper's experiments, chosen as the accumulated training loss attributed to p over the accumulation window (higher accumulated loss => the parent needs more children to help explain/reduce residual error, or activates more often)"
+          k_{l,p}: "number of layer-l children assigned to parent p"
+          s_l: "total number of features at privilege layer l (fixed, architecture-defined)"
+          m_l: "number of candidate parents for layer l = sum_{t=0}^{l-1} s_t (all features at strictly earlier layers, plus the root)"
+          note: "the 'payoff' of a child assigned to parent p is P_p = C_p / k_{l,p}; the objective maximizes the *minimum* payoff across all parents that receive at least one child, i.e. a max-min fairness allocation that avoids starving any parent's children of capacity/gradient signal"
+
+      - equation: "Theorem 4.1: exists allocation with min_{p|k_{l,p}>0}(C_p/k_{l,p}) >= tau  <=>  sum_{p=1}^{m_l} floor(C_p / tau) >= s_l"
+        equation_number: "Theorem 4.1 + proof, Section 4 and Appendix G"
+        where:
+          note: "this equivalence is what makes Eq. 10 solvable greedily in O(s_l log(m_l)): the optimal tau* is the s_l-th largest element of the multiset {C_p / k : p in 1..m_l, k = 1, 2, 3, ...}, found by repeatedly popping the parent with currently-highest marginal payoff C_p/(k_{l,p}+1) from a max-heap and incrementing its assigned count, s_l times total."
+
+    step_by_step_breakdown:
+      1. "Encode the batch through a single flat TopK SAE (Eq. 1) covering the union of all privilege layers' features."
+      2. "Recursively regularize activations layer-by-layer via the activation-coverage gate (Eq. 6), so a feature can only be 'on' if its assigned parent (which may be at ANY earlier layer, not just the immediately preceding one) is also 'on' in its regularized form."
+      3. "Compute cumulative per-layer reconstructions and the multi-level reconstruction loss (Eq. 7), which structurally forces parent vectors to capture general concepts and child vectors to refine the residual (proved in Appendix H)."
+      4. "Compute the per-privilege-layer auxiliary loss (Eq. 8) using only that layer's dead features, and combine into the total loss (Eq. 9) with mostly layer-1-only weighting in the main experiment."
+      5. "Periodically (every 3000-10000 steps, growing schedule) run Algorithm 2: recompute the optimal child count per parent via the greedy Algorithm 1 (Eq. 10 / Theorem 4.1), then reassign only the *dead* children at each layer via a first-fit strategy to move toward the optimal counts, leaving already-alive assignments untouched where possible."
+      6. "At ~50% of training, force any features still dead onto the root node so they can activate freely without gating."
+
+    implementation_details:
+      - "The parent pool for privilege layer l is ALL features in layers 0..l-1 (not just the immediately preceding layer) -- this is a key structural difference from a strictly-adjacent-level hierarchy: 'a feature at a higher layer are eligible to be assigned as a descendant of a feature at any lower layer'."
+      - "Layer 0 is an imaginary root node with s_0 = 1 'feature' that always outputs an 'active' regularized signal (it has no actual encoder/decoder of its own -- it exists purely so every real feature has a well-defined parent index, and features parented directly to the root are never gated, i.e. treated as independent/unconditional features)."
+      - "The activation function sigma is TopK-style (matching the paper's Top-k SAE / Matryoshka baselines for a fair comparison), applied over the WHOLE flat dictionary at encode time (raw f(x)), before the per-layer activation-coverage gating of Eq. 6 zeroes out some of those top-k activations."
+      - "Gradient normalization AND decoder-vector renormalization are both applied at every backward/optimizer step (Appendix C: 'We employ the Adam optimiser and normalise the gradient as well as the decoder vector at each backward step'); Appendix H's proofs additionally assume unit-norm decoder vectors (||d_p||=||d_c||=||d*_c||=1)."
+      - "Auxiliary loss (Eq. 8) reuses the standard Gao et al. (2024) mechanism: pick the top-256 (aux_topk=256) currently-dead features by pre-activation value and use them (with their own encoder pre-activations, NOT gated by Eq. 6) to reconstruct the current residual error; the Tree SAE-specific change is doing this PER PRIVILEGE LAYER rather than globally over the whole dictionary."
+      - "Dead-feature definition for the auxiliary loss / reallocation pool: no activation for 10,000,000 (10M) tokens (matches Gao et al. 2024 / Cunningham et al. 2023 convention)."
+      - "Parent ELIGIBILITY (a separate, stricter notion from 'not dead'): a feature is eligible to receive children only if its activation rate is at least 1 per 50,000 tokens -- sparser features are assumed not to warrant further decomposition."
+      - "Dictionary is partitioned into contiguous per-layer blocks; for the main experiment, 2-layer Tree SAE uses block sizes [6144, 18432] and 4-layer uses [1536, 3072, 9216, 10752] -- both derived as multiples of GPT2-small's hidden dimension (768), matching the corresponding Matryoshka SAE prefix sizes for a fair comparison."
+      - "Per-layer target L0 sparsity values (from Table 1, main experiment, matching Matryoshka's empirically observed average per-prefix L0 rounded to an integer) are hyperparameters, not learned quantities -- see all_hyperparameters below for the full table."
+
+  supporting_algorithms:
+    - algorithm_name: "Algorithm 1: Greedy allocation algorithm"
+      section: "Appendix G, line 897"
+      algorithm_box: "Explicit 'Algorithm 1' box in the paper (verbatim pseudocode reproduced below)."
+      pseudocode: |
+        Input: Capacity set C_l = {C_p, p in {1,...,m_l}}; number of child features s_l at layer l.
+        Initialize the (optimal) number of children per parent k*_{l,p} <- 0 for all p
+        H <- empty max-heap (keyed by current marginal payoff C_p / (k*_{l,p} + 1))
+        m_l <- |C_l|
+        for parent p in {1, ..., m_l}:
+            if parent is eligible():   # activation rate >= 1 per 50,000 tokens (Appendix G)
+                H <- H union (C_p / 1, p)
+        heapify H
+        assigned <- 0
+        while H is not empty and assigned < s_l:
+            (c, p) <- H.heap_pop()          # pop the (parent, marginal-payoff) with max c
+            k*_{l,p} <- k*_{l,p} + 1
+            c <- C_p / (k*_{l,p} + 1)       # recompute p's NEXT marginal payoff
+            H.heap_push((c, p))
+            assigned <- assigned + 1
+        return k*_l
+      mathematical_formulation:
+        - equation: "greedily pop the parent with max current marginal payoff C_p/(k+1) and increment its count, s_l times total"
+          equation_number: "Algorithm 1, Appendix G"
+      implementation_details:
+        - "Implement the max-heap with a standard binary heap keyed on marginal payoff (negate for Python's min-heap `heapq`, or use a max-heap wrapper)."
+        - "Complexity O(s_l log(m_l)): s_l pop+push operations, each O(log m_l)."
+        - "Ineligible parents (activation rate below 1/50,000 tokens) are excluded from the heap entirely at initialization and can never receive children in that round."
+        - "This directly implements the optimum of Eq. 10 per Theorem 4.1's constructive proof."
+
+    - algorithm_name: "Algorithm 2: Full dynamical feature reallocation algorithm"
+      section: "Appendix G, line 940"
+      algorithm_box: "Explicit 'Algorithm 2' box in the paper (verbatim pseudocode reproduced below)."
+      pseudocode: |
+        Input: current assignment vectors {a_l, for all l in 1..L}; number of child features
+               s_l at each layer l.
+        for layer l in {1, ..., L}:                       # processed in increasing layer order
+            compute capacity set C_l = {C_p, p in {1,...,m_l}}   # from the accumulated batch-loss sums
+            compute the number of children currently assigned to each parent under a_l: k_l
+            k*_l <- GreedyAllocationAlgorithm(C_l, s_l)          # Algorithm 1
+            sample the pool of dead child features at layer l    # inactive for 10M tokens
+            a_l <- AssignChildFeaturesToMatch(k*_l)              # see implementation_details
+        return {a_l, for all l in 1..L}
+      mathematical_formulation: []
+      implementation_details:
+        - "'AssignChildFeaturesToMatch(k*_l)' (not given as a separate numbered equation, described in prose right before Algorithm 2, line 923-927): for every parent p whose CURRENT number of non-dead children is below its target k*_{l,p}, use a first-fit strategy to assign dead child features (drawn from the sampled dead-feature pool at layer l) to p until either p reaches k*_{l,p} or the dead pool at that layer is exhausted; parents already at or above their target, and any already-alive (non-dead) children, are left untouched."
+        - "Optionally, a minimum/prerequisite number of child features can be enforced for the root node (layer 0) -- the paper notes this helps reduce dead features on some models (e.g. Gemma-2-2b)."
+        - "This algorithm ONLY reassigns DEAD features; already-active (alive) children are never moved by Algorithm 2, so already-good hierarchical relationships are preserved across reallocation events."
+        - "Called periodically during training per the reallocation schedule in `main_algorithm.implementation_details`: initial interval 3000 steps, +2000 per event, capped at 10000 steps; the capacity accumulators (running batch-loss sums per parent) are reset after each call."
+        - "Separately from Algorithm 2's per-reallocation dead-feature reassignment, the paper applies a ONE-TIME special rule at ~50% of total training: move ALL features still dead at that point directly to the root node (layer 0), regardless of their previous allocation or Algorithm 2's targets, so they are permanently ungated afterward."
+
+  components:
+    - component_name: "Flat multi-block TopK SAE encoder/decoder"
+      purpose: "A single standard SAE (Eq. 1-2) whose dictionary is partitioned into contiguous blocks, one block per privilege layer; the shared encoder/decoder/bias are the only *learned* parameters of the whole Tree SAE (the tree structure itself lives in the separately-tracked, non-gradient-based allocation vectors {a_l})."
+      architecture:
+        input: "x in R^{d_m} (GPT2-small layer-5 residual-stream activation, d_m = 768 in the main experiment)"
+        layers:
+          - "Encoder: We in R^{d_f x d_m}, TopK-style sparse activation sigma over the full flat dictionary of size d_f = sum_l s_l"
+          - "Decoder: Wd in R^{d_m x d_f}, block-decomposable into per-layer sub-matrices Wd_block[l] in R^{d_m x s_l}"
+        output: "reconstruction x_hat in R^{d_m}, plus per-layer cumulative partial reconstructions sum_{t<=l} x_hat_t"
+      special_features:
+        - "Decoder vectors renormalized to unit norm after every gradient step."
+        - "Gradients normalized at every backward step (in addition to the usual Adam optimizer statistics)."
+
+    - component_name: "Allocation / Tree-structure state"
+      purpose: "Non-parametric (not gradient-trained) per-layer allocation vectors {a_l}, each entry giving one feature's parent index among all features at strictly earlier privilege layers (or the root)."
+      architecture:
+        input: "capacity estimates C_p per candidate parent, updated from accumulated batch loss; dead/alive status per feature"
+        layers:
+          - "Root node at layer 0 (s_0 = 1), always considered 'active'/ungated"
+          - "Layers 1..L, each an integer array a_l of length s_l with values in {0, ..., m_l - 1} indexing into the concatenation of all features at layers 0..l-1"
+        output: "the parent-child tree/forest used by Eq. 6's recursive gating and by all downstream hierarchy-consistency evaluation"
+      special_features:
+        - "Updated only periodically (Algorithm 2), not every training step."
+        - "Reassignment only ever touches DEAD features (preserves already-good live hierarchical pairs)."
+
+  training_details:
+    training_loop:
+      outer_iterations: "Full training run over 500M tokens of The Pile at batch size 5120 (~97,656 steps); dynamic reallocation (Algorithm 2) fires on a growing schedule (3000, 5000, 7000, 9000, 10000, 10000, ... steps between events -- exact '+2' unit is ambiguous in the paper text, see missing_but_critical); a one-time dead-to-root reassignment fires at ~50,000 steps (~half of training)."
+      inner_iterations: "Each step: one forward/backward/optimizer-update pass over one batch of 5120 activations, plus capacity-accumulator bookkeeping."
+
+      steps:
+        1. "Sample a batch of 5120 activations from the pre-collected/streamed 500M-token dataset."
+        2. "Compute raw TopK feature activations f(x) over the full flat dictionary."
+        3. "Recursively compute activation-coverage-gated activations f*(x), layer by layer from the root outward, using the current allocation vectors {a_l}."
+        4. "Compute cumulative per-layer reconstructions and L_recons(x) (Eq. 7)."
+        5. "Compute per-layer auxiliary loss L_aux,l(x) (Eq. 8) using each layer's currently-dead features."
+        6. "Compute L_tree(x) = L_recons(x) + sum_l alpha_l * L_aux,l(x) (Eq. 9) and backpropagate."
+        7. "Adam optimizer step; normalize gradients; renormalize decoder vectors."
+        8. "Update per-parent capacity accumulators C_p with this batch's loss contribution for every instance where p is active."
+        9. "If this step matches the reallocation schedule: run Algorithm 2, reset capacity accumulators, grow the interval."
+        10. "If this step is the ~50%-of-training checkpoint: reassign all currently-dead features to the root node."
+
+      loss_functions:
+        - name: "L_recons (multi-level cumulative reconstruction loss)"
+          formula: "L_recons(x) = sum_{l=1}^{L} || sum_{t=1}^{l} x_hat_t - x ||_2^2"
+          components: "Sum, over privilege levels, of the squared error between x and the cumulative reconstruction using only features from layers 1..l; forces early (coarse) layers to be maximally informative on their own, with later layers refining the residual."
+        - name: "L_aux,l (per-layer dead-feature auxiliary loss)"
+          formula: "L_aux,l(x) = || e_hat_l + sum_{t=1}^{l} x_hat_t - x ||_2^2"
+          components: "Standard Gao et al. (2024) auxiliary loss, computed separately per privilege layer using only that layer's top-256 dead features."
+        - name: "L_tree (total training objective)"
+          formula: "L_tree(x) = L_recons(x) + sum_{l=1}^{L} alpha_l * L_aux,l(x)"
+          components: "Multi-level reconstruction loss plus per-layer-weighted auxiliary losses; alpha_1=1/32 and alpha_{2..L}=0 in the main experiment (alternative: alpha_l=1/128 for all l)."
+
+      optimization:
+        optimizer: "Adam"
+        learning_rate: "1e-4"
+        lr_schedule: "Not specified in paper (treated as constant 1e-4; [INFERRED] a paper-standard linear-warmup + constant or cosine-decay schedule could be substituted, but the text gives no schedule shape, only the flat rate)"
+        gradient_norm: "Gradients are normalized at every backward step (exact normalization scheme -- e.g. global-norm clipping vs. unit-norm rescaling -- not numerically specified; [INFERRED] implement as global gradient-norm clipping to 1.0, a common default)"
+        batch_size: 5120
+        other: "Decoder vectors renormalized to unit L2 norm after every step; TopK activation (hard top-k mask, straight-through or exact top-k selection -- paper does not restate the TopK mechanism itself, deferring to Gao et al. 2024)."
+
+  all_hyperparameters:
+    # Training (Appendix C)
+    batch_size: 5120
+    learning_rate: 1e-4
+    optimizer: "Adam"
+    training_tokens: 500_000_000
+    dataset: "The Pile (Gao et al., 2020)"
+    target_model: "GPT2-small (Radford et al., 2019)"
+    target_layer: 5
+    gradient_normalization: true
+    decoder_renormalization: "after every backward step"
+
+    # Architecture (Appendix C, Table 1)
+    dictionary_size_main: 24576
+    dictionary_size_scaling_small: 6144
+    dictionary_size_scaling_large: 49152
+    num_privilege_layers_variants: [2, 4]
+    layer_sizes_2layer_main: [6144, 18432]
+    layer_sizes_4layer_main: [1536, 3072, 9216, 10752]
+    l0_levels_main: [32, 48, 64, 80]
+    per_layer_l0_2layer:  # Table 1: [layer1, layer2] average L0 for Tree SAE 2 layers
+      L0_32: [26, 6]
+      L0_48: [40, 8]
+      L0_64: [53, 11]
+      L0_80: [69, 11]
+    per_layer_l0_4layer:  # Table 1: [layer1, layer2, layer3, layer4] average L0 for Tree SAE 4 layers
+      L0_32: [21, 5, 4, 2]
+      L0_48: [32, 7, 5, 4]
+      L0_64: [44, 9, 6, 5]
+      L0_80: [56, 11, 7, 6]
+
+    # Scaling experiment (Appendix C, Table 2)
+    scaling_l0: {dict_6k: 8, dict_49k: 64}
+    per_layer_l0_2layer_scaling:
+      dict_6k: [6, 2]
+      dict_49k: [55, 9]
+    per_layer_l0_4layer_scaling:
+      dict_6k: [5, 1, 1, 1]
+      dict_49k: [51, 4, 5, 4]
+
+    # Auxiliary loss (Appendix C)
+    aux_topk: 256
+    aux_coefficient_topk_and_matryoshka: 0.03125  # 1/32
+    aux_coefficient_tree_sae_main: {layer_1: 0.03125, layer_2_plus: 0.0}  # alpha_1=1/32, others 0
+    aux_coefficient_tree_sae_alternative: 0.0078125  # 1/128, all layers (noted as beneficial on e.g. Gemma-2-2b)
+
+    # Dynamic allocation (Appendix G)
+    reallocation_initial_interval_steps: 3000
+    reallocation_interval_increment_steps: 2000  # "increase the interval by two" -- INFERRED unit is 2000 (thousand) steps, see missing_but_critical
+    reallocation_interval_cap_steps: 10000
+    dead_to_root_reassignment_step_fraction: 0.5  # "around 50,000 steps" out of ~97,656 total steps
+    dead_feature_window_tokens: 10_000_000
+    parent_eligibility_min_rate: "1 activation per 50,000 tokens"
+
+    # Evaluation (Section 5, Appendix D)
+    hierarchy_metric_num_parents_sampled: 100
+    hierarchy_metric_parent_density_percentile: 50  # sample parents above the 50th percentile density
+    hierarchy_metric_top_k_children: 5
+    autointerp_num_features_sampled: 200
+    reconstruction_eval_tokens: 128_000
+    mcs_best_variant: "non-scaling, binary-activation correlation (Appendix I)"
+
+    location_references:
+      - "batch_size / learning_rate / optimizer / training_tokens / dataset / target_model / target_layer / gradient & decoder normalization: Appendix C ('SAE Training')"
+      - "dictionary sizes / layer sizes / per-layer L0 tables: Appendix C, Table 1, Table 2"
+      - "aux_topk / aux coefficients: Appendix C ('Auxiliary loss')"
+      - "reallocation schedule / dead-to-root reassignment / dead feature window / parent eligibility: Appendix G, and Section 4 prose immediately before Algorithm 1"
+      - "hierarchy metric sampling / autointerp / reconstruction eval settings: Section 5.2, 5.3, Appendix D"
+      - "MCS best variant: Appendix I"
+
+  implementation_notes:
+    - "Unlike an adjacent-level-only hierarchy (e.g. HSAE, arXiv:2602.11881), Tree SAE allows a child at layer l to be parented by ANY feature at any strictly earlier layer (0..l-1) -- the allocation vector a_l indexes into the full concatenation of all earlier layers' features, not just layer l-1."
+    - "Activation coverage (S_cov = 1) is enforced ARCHITECTURALLY via the recursive gate in Eq. 6, not as a soft loss term -- this is a key contrast with the paper's own critique of relying on the (post-hoc, threshold-based) activation-coverage MCS metric used by prior work."
+    - "The reconstruction condition (Eq. 5, S_res) is NOT directly optimized by a loss term either -- instead, Appendix H proves that combining Eq. 6's coverage gating with the multi-level reconstruction loss (Eq. 7) *implies* high S_res at convergence (Proposition 1), so implementers should treat S_res purely as an EVALUATION metric (needs a trained linear probe as ground truth d*_c per feature), not something to add to the training loss directly."
+      # -- notice this differs structurally from the companion HSAE paper (arXiv:2602.11881), which
+      #    does add an explicit parent-children constraint loss term directly to training.
+    - "The paper explicitly recommends AGAINST using the child's own encoder vector as a proxy for the true concept direction d*_c when computing S_res (Appendix H, Proposition 2) -- a separately trained linear probe per feature is required for faithful S_res evaluation."
+    - "Best MCS baseline variant (for comparison purposes, e.g. to reproduce Figure 4/5's MCS curves) is 'non-scaling, binary activation correlation' (Appendix I) -- i.e., binarize both parent and child activations (nonzero -> 1) and compute plain correlation, with no additional magnitude scaling."
+    - "The reallocation schedule's '+2' unit ('increase the interval by two after each allocation') is ambiguous in the source text; given the surrounding scale (3000 -> ... -> cap 10000), treating it as +2000 steps per event yields a plausible short sequence (3000, 5000, 7000, 9000, 10000, 10000, ...); flagged as [INFERRED] below."
+    - "The dead-feature auxiliary reconstruction e_hat_l (Eq. 8) is computed from RAW (ungated) dead-feature pre-activations (matching the standard Gao et al. 2024 aux-loss convention, which always operates on raw/ungated dead features to give them a gradient signal regardless of the main gating mechanism)."
+
+  missing_but_critical:
+    - "Exact TopK value(s) k used for the main sparse activation function sigma are not restated numerically in this paper -- the paper says 'we use the same Top-k activation function ... with four different L0 levels ranging from 32 to 80' (Appendix C), i.e. L0 itself IS the TopK k value per configuration (32, 48, 64, or 80). [Use L0 directly as TopK's k.]"
+    - "The exact initial allocation rule (how {a_l} is set before the first Algorithm 2 call) is not specified. [INFERRED: initialize uniformly at random among eligible parents at layers 0..l-1, or round-robin, documented as an implementation choice.]"
+    - "The precise capacity-accumulation window T (number of batches over which per-parent batch-loss is summed before solving Eq. 10) is described only as 'a predefined number of batches T' without a stated numeric value -- in context it appears to equal the current reallocation interval (3000-10000 steps). [INFERRED: T = the current reallocation interval.]"
+    - "The '+2' interval-growth unit for the reallocation schedule is ambiguous (could be +2 steps, +2000 steps, or x2 multiplicatively). [INFERRED default: +2000 steps per event, i.e. 3000, 5000, 7000, 9000, 10000(capped), ... -- exposed as a configurable constant.]"
+    - "The exact gradient-normalization scheme ('we ... normalise the gradient ... at each backward step') is not specified numerically (global-norm clip value, or unit-norm rescale). [INFERRED: global gradient-norm clipping to a norm of 1.0, a common default; exposed as a configurable constant.]"
+    - "The learning-rate schedule shape (constant vs. warmup vs. decay) is not given -- only the flat value 1e-4. [INFERRED: use a constant learning rate by default, exposed as configurable.]"
+    - "How ties are broken in the greedy allocation heap (Algorithm 1) when multiple parents have equal marginal payoff is not specified. [INFERRED: arbitrary/stable tie-breaking via insertion order, which does not affect the OPTIMAL VALUE achieved (only which specific parent among equals receives the next child), per the proof in Appendix G.]"
